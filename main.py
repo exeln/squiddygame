@@ -1,13 +1,12 @@
 ###########################
 # main.py
 ###########################
-
 import os
 import random
 import discord
 from discord.ext import commands
 
-from flask import Flask, request, redirect, session
+from flask import Flask, request
 from threading import Thread
 
 import spotipy
@@ -19,7 +18,6 @@ SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
 # ----- CONFIGURATIONS -----
-# Adjust these as needed
 BOT_PREFIX = '!'
 REDIRECT_URI = "https://web-production-b04e.up.railway.app/callback"  
 SCOPES = "user-read-recently-played"
@@ -39,7 +37,6 @@ user_spotify_data = {}
 app = Flask(__name__)
 app.secret_key = "some-random-secret-key"
 
-# Set up the Spotify Oauth
 def create_spotify_oauth(state=None):
     return SpotifyOAuth(
         client_id=SPOTIFY_CLIENT_ID,
@@ -64,17 +61,15 @@ def callback():
     """
     sp_oauth = create_spotify_oauth()
     code = request.args.get("code")
-    state = request.args.get("state")  # The Discord user ID we passed in
+    state = request.args.get("state")
     error = request.args.get("error")
 
     if error:
         return f"There was an error during Spotify authorization: {error}", 400
 
     if code:
-        # Exchange code for token
         token_info = sp_oauth.get_access_token(code)
         if token_info:
-            # Store token_info in our in-memory dictionary
             discord_user_id = str(state)
             user_spotify_data[discord_user_id] = token_info
             return "Authorization successful! You can close this tab and return to Discord."
@@ -83,19 +78,16 @@ def callback():
     else:
         return "No code returned from Spotify.", 400
 
-# Function to refresh token if needed
 def get_spotify_client(discord_user_id):
     """
-    Returns a Spotipy client for the given Discord user ID, 
+    Returns a Spotipy client for the given Discord user ID,
     automatically refreshing the token if it's expired.
     """
     token_info = user_spotify_data.get(str(discord_user_id))
     if not token_info:
-        return None  # User not authorized
+        return None
 
     sp_oauth = create_spotify_oauth()
-    
-    # Check if token is expired
     if sp_oauth.is_token_expired(token_info):
         token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
         user_spotify_data[str(discord_user_id)] = token_info
@@ -105,9 +97,8 @@ def get_spotify_client(discord_user_id):
 
 # ----- DISCORD BOT SETUP -----
 intents = discord.Intents.default()
-intents.message_content = True  # Make sure to enable this intent in your Discord bot settings
+intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
-
 
 @bot.event
 async def on_ready():
@@ -146,25 +137,21 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Add the user to the set of players
     active_game["players"].add(user_id)
-
-    # Create an OAuth object with the state as the Discord user ID
     sp_oauth = create_spotify_oauth(state=user_id)
     auth_url = sp_oauth.get_authorize_url()
     
-    # DM or public message with the authorization link:
+    # DM the authorization link
     await ctx.author.send(
         "Click the link below to authorize with Spotify:\n" + auth_url
     )
-
     await ctx.send(f"{ctx.author.mention} has joined the game! Check your DMs to authorize Spotify.")
 
 
 @bot.command()
 async def play(ctx):
     """
-    Fetch each player's recently played tracks, compile them, 
+    Fetch each player's recently played tracks, compile them,
     and start a 'guess who' round.
     """
     if not active_game["status"]:
@@ -174,9 +161,9 @@ async def play(ctx):
         await ctx.send("Need at least 2 players to play!")
         return
 
-    # Build track pool from each player's recently played
     track_pool = []
-    user_track_ids = {}  # Track which songs have been added for each user
+    # We'll keep track of which track IDs have already been added for each user
+    user_track_ids = {}
 
     for player_id in active_game["players"]:
         sp_client = get_spotify_client(player_id)
@@ -184,31 +171,37 @@ async def play(ctx):
             # Player not authorized or no token
             continue
 
-        # Initialize a set to track songs already added for this user
+        # Keep a set of track IDs we've already added for this user
         user_track_ids[player_id] = set()
 
-        # Fetch recently played tracks
         try:
             results = sp_client.current_user_recently_played(limit=20)
             for item in results["items"]:
                 track = item["track"]
                 track_id = track["id"]
+
+                # skip if there's no valid track ID (local songs, etc.)
+                if not track_id:
+                    continue
+                
+                if track_id in user_track_ids[player_id]:
+                    # Already added this track for the user
+                    continue
+
+                user_track_ids[player_id].add(track_id)
+
                 track_name = track["name"]
                 artist_name = track["artists"][0]["name"]
 
-                # Check if this track has already been added for this user
-                if track_id not in user_track_ids[player_id]:
-                    # Add the track to the user's set of added tracks
-                    user_track_ids[player_id].add(track_id)
+                # Check if this track is already in our global pool
+                existing_track = next((t for t in track_pool if t[0] == track_id), None)
+                if existing_track:
+                    # If it already exists, merge this user into the owners set
+                    existing_track[3].add(player_id)
+                else:
+                    # Otherwise, create a new entry with this user as the owner
+                    track_pool.append((track_id, track_name, artist_name, {player_id}))
 
-                    # Check if the track already exists in the global pool
-                    existing_track = next((t for t in track_pool if t[0] == track_id), None)
-                    if existing_track:
-                        # If the track exists, add this player to the owners set
-                        existing_track[3].add(player_id)
-                    else:
-                        # If the track doesn't exist, add it to the pool with this player as the owner
-                        track_pool.append((track_id, track_name, artist_name, {player_id}))
         except Exception as e:
             print(f"Error fetching recent tracks for user {player_id}: {e}")
 
@@ -216,15 +209,11 @@ async def play(ctx):
         await ctx.send("No tracks found or players not authorized. Make sure everyone has connected their Spotify.")
         return
 
-    # Shuffle the track pool to randomize order
     random.shuffle(track_pool)
-
     active_game["track_pool"] = track_pool
     active_game["current_round"] = 0
 
     await ctx.send("Track pool compiled! Starting the game...")
-
-    # Let's show one track to guess as a demo
     await do_guess_round(ctx)
 
 
@@ -233,23 +222,22 @@ async def do_guess_round(ctx):
     Conduct a single guess round:
     1. Pick the next track from the pool.
     2. Prompt the channel: "Who does this track belong to?"
-    3. Wait for guesses.
+    3. Wait for guesses via !guess.
     """
     if active_game["current_round"] >= len(active_game["track_pool"]):
-        # No more tracks
         await ctx.send("All tracks have been guessed! Game over.")
         active_game["status"] = False
         return
 
     track_info = active_game["track_pool"][active_game["current_round"]]
-    track_id, track_name, artist_name, owner_ids = track_info
+    _, track_name, artist_name, owner_ids = track_info
 
-    # Prompt
-    await ctx.send(f"**Guess Round {active_game['current_round']+1}:**\n"
-                   f"**Track:** {track_name} by {artist_name}\n"
-                   "Who does this track belong to? Type `!guess @username`.")
+    await ctx.send(
+        f"**Guess Round {active_game['current_round']+1}:**\n"
+        f"**Track:** {track_name} by {artist_name}\n"
+        "Who does this track belong to? Type `!guess @username`."
+    )
 
-    # Increment round pointer
     active_game["current_round"] += 1
 
 
@@ -262,10 +250,9 @@ async def end(ctx):
         await ctx.send("No game is currently running.")
         return
 
-    # Reset the active game data
     active_game["status"] = False
-    active_game["players"] = set()
-    active_game["track_pool"] = []
+    active_game["players"].clear()
+    active_game["track_pool"].clear()
     active_game["current_round"] = 0
 
     await ctx.send("The game has been ended. All data has been reset.")
@@ -285,37 +272,28 @@ async def guess(ctx, user_mention: discord.User = None):
         await ctx.send("Please mention a user to guess. Example: `!guess @SomeUser`")
         return
 
-    # The track that was just posted
-    current_round_index = active_game["current_round"] - 1  # Because we already incremented
+    # The track that was just posted in the current round
+    current_round_index = active_game["current_round"] - 1
     if current_round_index < 0:
         await ctx.send("No track is currently being guessed.")
         return
 
-    track_info = active_game["track_pool"][current_round_index]
-    _, track_name, artist_name, owner_ids = track_info
+    _, track_name, artist_name, owner_ids = active_game["track_pool"][current_round_index]
 
-    # Check if guess is correct
+    # If the guessed user is in the owners set, it's correct
     if str(user_mention.id) in owner_ids:
-        # Get mentions for all owners of the track
         owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
-        owner_mentions_str = ", ".join(owner_mentions)
-
-        await ctx.send(
-            f"Correct! The track '{track_name}' by {artist_name} belongs to {owner_mentions_str}!"
-        )
+        owners_str = ", ".join(owner_mentions)
+        await ctx.send(f"Correct! The track '{track_name}' by {artist_name} belongs to {owners_str}!")
     else:
-        # Let them know it's incorrect
         owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
-        owner_mentions_str = ", ".join(owner_mentions)
+        owners_str = ", ".join(owner_mentions)
+        await ctx.send(f"Wrong guess! The correct answer was {owners_str}.")
 
-        await ctx.send(f"Wrong guess! The correct answer was {owner_mentions_str}.")
-
-    # Proceed to next round (or end)
+    # Move on to the next round, or end if no more tracks
     if active_game["current_round"] < len(active_game["track_pool"]):
-        # Move on to the next track
         await do_guess_round(ctx)
     else:
-        # No more tracks
         await ctx.send("All tracks have been used! Game over.")
         active_game["status"] = False
 
@@ -325,13 +303,9 @@ def run_flask():
     port = int(os.getenv("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-
 def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
-# Keep the Flask server alive
 keep_alive()
-
-# ----- START THE DISCORD BOT -----
 bot.run(DISCORD_BOT_TOKEN)
