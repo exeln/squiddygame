@@ -21,7 +21,7 @@ DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 # ----- CONFIGURATIONS -----
 # Adjust these as needed
 BOT_PREFIX = '!'
-REDIRECT_URI = "https://<YOUR-REPL-SUBDOMAIN>.<USERNAME>.repl.co/callback"  
+REDIRECT_URI = "web-production-b04e.up.railway.app/callback"  
 # Replace <YOUR-REPL-SUBDOMAIN>.<USERNAME> with your actual Repl domain
 SCOPES = "user-read-recently-played"
 
