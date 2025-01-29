@@ -240,6 +240,23 @@ async def do_guess_round(ctx):
 
 
 @bot.command()
+async def end(ctx):
+    """
+    End the current game and reset all game data.
+    """
+    if not active_game["status"]:
+        await ctx.send("No game is currently running.")
+        return
+
+    # Reset the active game data
+    active_game["status"] = False
+    active_game["players"] = set()
+    active_game["track_pool"] = []
+    active_game["current_round"] = 0
+
+    await ctx.send("The game has been ended. All data has been reset.")
+
+@bot.command()
 async def guess(ctx, user_mention: discord.User = None):
     """
     Player guesses which user the current track belongs to.
