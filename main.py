@@ -282,7 +282,9 @@ async def guess(ctx, user_mention: discord.User = None):
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.getenv("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
 
 def keep_alive():
     t = Thread(target=run_flask)
