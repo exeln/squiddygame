@@ -22,15 +22,14 @@ DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 # Adjust these as needed
 BOT_PREFIX = '!'
 REDIRECT_URI = "https://web-production-b04e.up.railway.app/callback"  
-# Replace <YOUR-REPL-SUBDOMAIN>.<USERNAME> with your actual Repl domain
 SCOPES = "user-read-recently-played"
 
 # In-memory storage for active game data
 active_game = {
     "status": False,     # Whether a game has been started
     "players": set(),    # Discord user IDs who joined
-    "track_pool": [],    # (track, owner_id) pairs for the current game
-    "current_round": 0   # Example round counter
+    "track_pool": [],    # (track_id, track_name, artist_name, owner_ids) tuples
+    "current_round": 0   # Current round counter
 }
 
 # In-memory storage for user Spotify data: { discord_user_id: token_info }
@@ -38,7 +37,6 @@ user_spotify_data = {}
 
 # ----- FLASK APP FOR SPOTIFY OAUTH -----
 app = Flask(__name__)
-# We need a secret key for Flask sessions (use a random, strong key in production):
 app.secret_key = "some-random-secret-key"
 
 # Set up the Spotify Oauth
@@ -178,11 +176,17 @@ async def play(ctx):
 
     # Build track pool from each player's recently played
     track_pool = []
+    user_track_ids = {}  # Track which songs have been added for each user
+
     for player_id in active_game["players"]:
         sp_client = get_spotify_client(player_id)
         if sp_client is None:
             # Player not authorized or no token
             continue
+
+        # Initialize a set to track songs already added for this user
+        user_track_ids[player_id] = set()
+
         # Fetch recently played tracks
         try:
             results = sp_client.current_user_recently_played(limit=20)
@@ -191,10 +195,20 @@ async def play(ctx):
                 track_id = track["id"]
                 track_name = track["name"]
                 artist_name = track["artists"][0]["name"]
-                
-                # We'll store the track as a tuple (track_id, track_name, artist_name, owner_id)
-                if track_id not in [t[0] for t in track_pool]:
-                    track_pool.append((track_id, track_name, artist_name, player_id))
+
+                # Check if this track has already been added for this user
+                if track_id not in user_track_ids[player_id]:
+                    # Add the track to the user's set of added tracks
+                    user_track_ids[player_id].add(track_id)
+
+                    # Check if the track already exists in the global pool
+                    existing_track = next((t for t in track_pool if t[0] == track_id), None)
+                    if existing_track:
+                        # If the track exists, add this player to the owners set
+                        existing_track[3].add(player_id)
+                    else:
+                        # If the track doesn't exist, add it to the pool with this player as the owner
+                        track_pool.append((track_id, track_name, artist_name, {player_id}))
         except Exception as e:
             print(f"Error fetching recent tracks for user {player_id}: {e}")
 
@@ -228,7 +242,7 @@ async def do_guess_round(ctx):
         return
 
     track_info = active_game["track_pool"][active_game["current_round"]]
-    track_id, track_name, artist_name, owner_id = track_info
+    track_id, track_name, artist_name, owner_ids = track_info
 
     # Prompt
     await ctx.send(f"**Guess Round {active_game['current_round']+1}:**\n"
@@ -256,6 +270,7 @@ async def end(ctx):
 
     await ctx.send("The game has been ended. All data has been reset.")
 
+
 @bot.command()
 async def guess(ctx, user_mention: discord.User = None):
     """
@@ -277,15 +292,23 @@ async def guess(ctx, user_mention: discord.User = None):
         return
 
     track_info = active_game["track_pool"][current_round_index]
-    _, track_name, artist_name, owner_id = track_info
+    _, track_name, artist_name, owner_ids = track_info
 
     # Check if guess is correct
-    if str(user_mention.id) == owner_id:
-        await ctx.send(f"Correct! The track '{track_name}' by {artist_name} belongs to {user_mention.mention}!")
+    if str(user_mention.id) in owner_ids:
+        # Get mentions for all owners of the track
+        owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
+        owner_mentions_str = ", ".join(owner_mentions)
+
+        await ctx.send(
+            f"Correct! The track '{track_name}' by {artist_name} belongs to {owner_mentions_str}!"
+        )
     else:
         # Let them know it's incorrect
-        actual_owner = await bot.fetch_user(int(owner_id))
-        await ctx.send(f"Wrong guess! The correct answer was {actual_owner.mention}.")
+        owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
+        owner_mentions_str = ", ".join(owner_mentions)
+
+        await ctx.send(f"Wrong guess! The correct answer was {owner_mentions_str}.")
 
     # Proceed to next round (or end)
     if active_game["current_round"] < len(active_game["track_pool"]):
