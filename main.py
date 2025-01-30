@@ -279,12 +279,17 @@ async def guess(ctx, user_mention: discord.User = None):
         return
 
     _, track_name, artist_name, owner_ids = active_game["track_pool"][current_round_index]
+    guessed_user_id = str(user_mention.id)
 
-    # If the guessed user is in the owners set, it's correct
-    if str(user_mention.id) in owner_ids:
-        owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
-        owners_str = ", ".join(owner_mentions)
-        await ctx.send(f"Correct! The track '{track_name}' by {artist_name} belongs to {owners_str}!")
+    # Check if the guessed user is one of the owners
+    if guessed_user_id in owner_ids:
+        # Only show all owners if there are multiple
+        if len(owner_ids) > 1:
+            owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
+            owners_str = ", ".join(owner_mentions)
+            await ctx.send(f"Correct! The track '{track_name}' by {artist_name} was in multiple users' recently played: {owners_str}!")
+        else:
+            await ctx.send(f"Correct! The track '{track_name}' by {artist_name} belongs to {user_mention.mention}!")
     else:
         owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
         owners_str = ", ".join(owner_mentions)
