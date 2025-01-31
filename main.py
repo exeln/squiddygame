@@ -68,11 +68,23 @@ def callback():
         return f"There was an error during Spotify authorization: {error}", 400
 
     if code:
-        token_info = sp_oauth.get_access_token(code)
+        try:
+            token_info = sp_oauth.get_access_token(code)
+        except Exception as e:
+            return f"Error obtaining access token: {e}", 400
+
         if token_info:
             discord_user_id = str(state)
+
+            # --- Debug prints to avoid accidental overwriting ---
+            print(f"DEBUG: Received token_info for Discord user {discord_user_id}: {token_info}")
             user_spotify_data[discord_user_id] = token_info
-            return "Authorization successful! You can close this tab and return to Discord."
+            print(f"DEBUG: user_spotify_data keys are now: {list(user_spotify_data.keys())}")
+            # ---------------------------------------------------
+
+            return (
+                "Authorization successful! You can close this tab and return to Discord."
+            )
         else:
             return "Could not get token info from Spotify.", 400
     else:
@@ -89,8 +101,13 @@ def get_spotify_client(discord_user_id):
 
     sp_oauth = create_spotify_oauth()
     if sp_oauth.is_token_expired(token_info):
-        token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
-        user_spotify_data[str(discord_user_id)] = token_info
+        try:
+            refreshed_token = sp_oauth.refresh_access_token(token_info["refresh_token"])
+        except Exception as e:
+            print(f"DEBUG: Error refreshing token for Discord user {discord_user_id}: {e}")
+            return None
+        user_spotify_data[str(discord_user_id)] = refreshed_token
+        token_info = refreshed_token
 
     return spotipy.Spotify(auth=token_info["access_token"])
 
@@ -169,6 +186,19 @@ async def play(ctx):
         sp_client = get_spotify_client(player_id)
         if sp_client is None:
             print(f"DEBUG: No Spotify client for user {player_id}. Possibly not authorized.")
+            continue
+
+        # FIRST: Check which Spotify account this user is on
+        try:
+            user_info = sp_client.me()
+            spotify_user_id = user_info.get("id", "unknown_id")
+            spotify_display_name = user_info.get("display_name", "Unknown Display Name")
+            print(
+                f"DEBUG: Discord user {player_id} is logged into Spotify as ID '{spotify_user_id}', "
+                f"display name: '{spotify_display_name}'"
+            )
+        except Exception as e:
+            print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
             continue
 
         # Debug: Show we are fetching data for this user
