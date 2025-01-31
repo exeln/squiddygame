@@ -19,7 +19,7 @@ DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
 # ----- CONFIGURATIONS -----
 BOT_PREFIX = '!'
-REDIRECT_URI = "https://web-production-b04e.up.railway.app/callback"  
+REDIRECT_URI = "https://web-production-b04e.up.railway.app/callback"
 SCOPES = "user-read-recently-played"
 
 # In-memory storage for active game data
@@ -168,14 +168,20 @@ async def play(ctx):
     for player_id in active_game["players"]:
         sp_client = get_spotify_client(player_id)
         if sp_client is None:
-            # Player not authorized or no token
+            print(f"DEBUG: No Spotify client for user {player_id}. Possibly not authorized.")
             continue
+
+        # Debug: Show we are fetching data for this user
+        print(f"DEBUG: Fetching recently played tracks for user {player_id} ...")
 
         # Keep a set of track IDs we've already added for this user
         user_track_ids[player_id] = set()
 
         try:
             results = sp_client.current_user_recently_played(limit=20)
+            items_count = len(results['items'])
+            print(f"DEBUG: Found {items_count} recently played items for user {player_id}.")
+
             for item in results["items"]:
                 track = item["track"]
                 track_id = track["id"]
@@ -183,7 +189,10 @@ async def play(ctx):
                 # skip if there's no valid track ID (local songs, etc.)
                 if not track_id:
                     continue
-                
+
+                # Debug: Show track being processed
+                print(f"DEBUG: Processing track for user {player_id} -> {track.get('name')} (ID: {track_id})")
+
                 if track_id in user_track_ids[player_id]:
                     # Already added this track for the user
                     continue
@@ -196,10 +205,16 @@ async def play(ctx):
                 # Check if this track is already in our global pool
                 existing_track = next((t for t in track_pool if t[0] == track_id), None)
                 if existing_track:
-                    # If it already exists, merge this user into the owners set
+                    # ── DEBUG PRINT ─────────────────────────────────────────────
+                    print(f"DEBUG: Merging track '{track_name}' (ID: {track_id})")
+                    print(f"       Existing owners: {existing_track[3]}")
+                    print(f"       Adding new owner: {player_id}")
+                    # ────────────────────────────────────────────────────────────
                     existing_track[3].add(player_id)
                 else:
-                    # Otherwise, create a new entry with this user as the owner
+                    # ── DEBUG PRINT ─────────────────────────────────────────────
+                    print(f"DEBUG: New track '{track_name}' (ID: {track_id}), owned by {player_id}")
+                    # ────────────────────────────────────────────────────────────
                     track_pool.append((track_id, track_name, artist_name, {player_id}))
 
         except Exception as e:
@@ -281,15 +296,30 @@ async def guess(ctx, user_mention: discord.User = None):
     _, track_name, artist_name, owner_ids = active_game["track_pool"][current_round_index]
     guessed_user_id = str(user_mention.id)
 
+    # ── DEBUG PRINTS (GUESS COMMAND) ─────────────────────────────────────────
+    print("DEBUG: ===== GUESS COMMAND TRIGGERED =====")
+    print(f"DEBUG: Track name -> {track_name}")
+    print(f"DEBUG: Artist -> {artist_name}")
+    print(f"DEBUG: Track owner IDs -> {owner_ids}")
+    print(f"DEBUG: Guessed user -> {guessed_user_id}")
+    print(f"DEBUG: Is guessed_user_id in owner_ids? -> {guessed_user_id in owner_ids}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Check if the guessed user is one of the owners
     if guessed_user_id in owner_ids:
         # Only show all owners if there are multiple
         if len(owner_ids) > 1:
             owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
             owners_str = ", ".join(owner_mentions)
-            await ctx.send(f"Correct! The track '{track_name}' by {artist_name} was in multiple users' recently played: {owners_str}!")
+            await ctx.send(
+                f"Correct! The track '{track_name}' by {artist_name} "
+                f"was in multiple users' recently played: {owners_str}!"
+            )
         else:
-            await ctx.send(f"Correct! The track '{track_name}' by {artist_name} belongs to {user_mention.mention}!")
+            await ctx.send(
+                f"Correct! The track '{track_name}' by {artist_name} "
+                f"belongs to {user_mention.mention}!"
+            )
     else:
         owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
         owners_str = ", ".join(owner_mentions)
