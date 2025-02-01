@@ -22,15 +22,15 @@ SCOPES = "user-read-recently-played"
 
 # In-memory storage for active game data
 active_game = {
-    "status": False,            # Whether a game has been started
-    "players": set(),           # Discord user IDs who joined
-    "track_pool": [],           # (track_id, track_name, artist_name, owner_ids) tuples
-    "current_round": 0,         # Current round counter
-    "round_in_progress": False, # For the timed guessing version
-    "round_guesses": {}         # { guesser_discord_id: guessed_discord_id }
+    "status": False,
+    "players": set(),
+    "track_pool": [],
+    "current_round": 0,
+    "round_in_progress": False,
+    "round_guesses": {}
 }
 
-# Track where each user typed !join, so we can announce them as "ready" in that same channel
+# We'll store the channel ID where each user typed !join, so we can announce them in that channel
 join_channels = {}  # { str(discord_user_id): int(channel_id) }
 
 # In-memory storage for user Spotify data: { discord_user_id: token_info }
@@ -56,12 +56,6 @@ def index():
 
 @app.route("/callback")
 def callback():
-    """
-    Spotify redirects here after user authorizes.
-    We exchange the authorization code for an access token.
-    The `state` we sent contains the Discord user ID, 
-    so we know which user to associate with the token.
-    """
     code = request.args.get("code")
     state = request.args.get("state")
     error = request.args.get("error")
@@ -71,7 +65,6 @@ def callback():
 
     if code:
         try:
-            # Create a new SpotifyOAuth instance for this specific user
             sp_oauth = create_spotify_oauth(state=state)
             token_info = sp_oauth.get_access_token(code, check_cache=False)
         except Exception as e:
@@ -84,37 +77,48 @@ def callback():
             user_spotify_data[discord_user_id] = token_info
             print(f"DEBUG: user_spotify_data keys are now: {list(user_spotify_data.keys())}")
 
-            # After successful authorization, post in the original channel
             def confirm_authorization():
-                print(f"DEBUG: confirm_authorization triggered for user {discord_user_id}")
-                # Let's see what channel ID we have stored
-                channel_id = join_channels.get(discord_user_id)
-                print(f"DEBUG: join_channels keys -> {join_channels.keys()}")
-                print(f"DEBUG: channel_id from join_channels is {channel_id} for user {discord_user_id}")
+                """
+                We'll define an async function inside so we can fetch the user properly.
+                """
+                async def confirm_authorization_async():
+                    print(f"DEBUG: confirm_authorization triggered for user {discord_user_id}")
+                    print(f"DEBUG: join_channels keys -> {join_channels.keys()}")
 
-                if channel_id is None:
-                    print(f"DEBUG: No stored channel ID for user {discord_user_id}")
-                    return
+                    channel_id = join_channels.get(discord_user_id)
+                    print(f"DEBUG: channel_id from join_channels is {channel_id} for user {discord_user_id}")
 
-                channel = bot.get_channel(channel_id)
-                print(f"DEBUG: get_channel({channel_id}) returned: {channel}")
+                    if channel_id is None:
+                        print(f"DEBUG: No stored channel ID for user {discord_user_id}")
+                        return
 
-                if channel is None:
-                    print(f"DEBUG: Could not find channel object for channel_id {channel_id}. "
-                          f"Make sure the bot has access to that channel, and that it wasn't a DM or thread.")
-                    return
+                    channel = bot.get_channel(channel_id)
+                    print(f"DEBUG: get_channel({channel_id}) returned: {channel}")
 
-                user_obj = bot.get_user(int(discord_user_id))
-                print(f"DEBUG: get_user({discord_user_id}) returned: {user_obj}")
+                    if channel is None:
+                        print(
+                            f"DEBUG: Could not find channel object for channel_id {channel_id}. "
+                            f"Make sure the bot has access to that channel and it wasn't a thread or DM."
+                        )
+                        return
 
-                if user_obj is not None:
-                    msg = f"{user_obj.mention} is now ready to play!"
-                    coro = channel.send(msg)
-                    asyncio.run_coroutine_threadsafe(coro, bot.loop)
-                else:
-                    print(f"DEBUG: Could not find user object for {discord_user_id} to mention.")
+                    try:
+                        # Use fetch_user to reliably get the user even if they're not cached
+                        user_obj = await bot.fetch_user(int(discord_user_id))
+                        print(f"DEBUG: fetch_user({discord_user_id}) returned: {user_obj}")
+                    except Exception as ex:
+                        print(f"DEBUG: Exception fetching user {discord_user_id}: {ex}")
+                        return
 
-            # Schedule this function to run in the bot event loop
+                    if user_obj is not None:
+                        msg = f"{user_obj.mention} is now ready to play!"
+                        await channel.send(msg)
+                    else:
+                        print(f"DEBUG: Could not fetch user object for {discord_user_id} to mention.")
+
+                # Schedule the async function
+                asyncio.run_coroutine_threadsafe(confirm_authorization_async(), bot.loop)
+
             bot.loop.call_soon_threadsafe(confirm_authorization)
 
             return "Authorization successful! You can close this tab and return to Discord."
@@ -125,10 +129,6 @@ def callback():
 
 
 def get_spotify_client(discord_user_id):
-    """
-    Returns a Spotipy client for the given Discord user ID,
-    automatically refreshing the token if it's expired.
-    """
     token_info = user_spotify_data.get(str(discord_user_id))
     if not token_info:
         return None
@@ -148,6 +148,9 @@ def get_spotify_client(discord_user_id):
 # ----- DISCORD BOT SETUP -----
 intents = discord.Intents.default()
 intents.message_content = True
+# For user references to work properly, you may need these:
+# intents.members = True
+# Or in the Developer Portal, enable the "Server Members Intent"
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
 @bot.event
@@ -157,9 +160,6 @@ async def on_ready():
 # ----- DISCORD COMMANDS -----
 @bot.command()
 async def start(ctx):
-    """
-    Start a new game session. Resets state, etc.
-    """
     if active_game["status"]:
         await ctx.send("A game is already in progress.")
         return
@@ -175,10 +175,6 @@ async def start(ctx):
 
 @bot.command()
 async def join(ctx):
-    """
-    User joins the game, we remember the channel they typed !join in,
-    so we can announce them as "ready" after they finish authorizing.
-    """
     if not active_game["status"]:
         await ctx.send("No game is currently running. Use `!start` to create a new game.")
         return
@@ -188,7 +184,7 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Store the channel ID where they typed !join
+    # Store the channel ID
     join_channels[user_id] = ctx.channel.id
     active_game["players"].add(user_id)
 
@@ -206,10 +202,6 @@ async def join(ctx):
 
 @bot.command()
 async def play(ctx):
-    """
-    Fetch each player's recently played tracks, compile them,
-    and start a 'guess who' round (timed).
-    """
     if not active_game["status"]:
         await ctx.send("No game is active. Use `!start` to begin.")
         return
@@ -226,7 +218,6 @@ async def play(ctx):
             print(f"DEBUG: No Spotify client for user {player_id}. Possibly not authorized.")
             continue
 
-        # Check which Spotify account this user is on
         try:
             user_info = sp_client.me()
             spotify_user_id = user_info.get("id", "unknown_id")
@@ -240,7 +231,6 @@ async def play(ctx):
             continue
 
         print(f"DEBUG: Fetching recently played tracks for user {player_id} ...")
-
         user_track_ids[player_id] = set()
 
         try:
@@ -251,7 +241,6 @@ async def play(ctx):
             for item in results["items"]:
                 track = item["track"]
                 track_id = track["id"]
-
                 if not track_id:
                     continue
 
@@ -290,9 +279,6 @@ async def play(ctx):
     await do_guess_round(ctx)
 
 async def do_guess_round(ctx):
-    """
-    Conduct a single guess round with a 10-second timer.
-    """
     if active_game["current_round"] >= len(active_game["track_pool"]):
         await ctx.send("All tracks have been guessed! Game over.")
         active_game["status"] = False
@@ -307,17 +293,13 @@ async def do_guess_round(ctx):
         "You have 10 seconds! Type `!guess @username` to guess."
     )
 
-    # Set round in progress and clear previous guesses
     active_game["round_in_progress"] = True
     active_game["round_guesses"] = {}
 
-    # Wait 10 seconds
     await asyncio.sleep(10)
 
-    # Round ended, evaluate guesses
     active_game["round_in_progress"] = False
 
-    # Build a list of winners
     winners = []
     for guesser_id, guessed_user_id in active_game["round_guesses"].items():
         if guessed_user_id in owner_ids:
@@ -337,16 +319,11 @@ async def do_guess_round(ctx):
             f"The track '{track_name}' belongs to {owner_mentions}."
         )
 
-    # Move on to the next round
     active_game["current_round"] += 1
     await do_guess_round(ctx)
 
 @bot.command()
 async def guess(ctx, user_mention: discord.User = None):
-    """
-    Each user can guess once per 10-second round.
-    We'll record it, then check winners after the timer ends.
-    """
     if not active_game["status"]:
         await ctx.send("No active game right now.")
         return
@@ -360,7 +337,6 @@ async def guess(ctx, user_mention: discord.User = None):
         return
 
     guesser_id = str(ctx.author.id)
-
     if guesser_id in active_game["round_guesses"]:
         await ctx.send("You have already guessed this round!")
         return
@@ -371,9 +347,6 @@ async def guess(ctx, user_mention: discord.User = None):
 
 @bot.command()
 async def end(ctx):
-    """
-    End the current game and reset all game data.
-    """
     if not active_game["status"]:
         await ctx.send("No game is currently running.")
         return
