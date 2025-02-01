@@ -28,7 +28,7 @@ active_game = {
     "current_round": 0,     # Current round counter
     "round_in_progress": False,
     "round_guesses": {},    # { guesser_discord_id: guessed_discord_id }
-    "points": {}            # { user_id: int }  <--- NEW: track points
+    "points": {}            # { user_id: int } for scoring
 }
 
 # We'll store the channel ID where each user typed !join
@@ -153,13 +153,9 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
 
-
 # ----- DISCORD COMMANDS -----
 @bot.command()
 async def start(ctx):
-    """
-    Start a new game session. Resets state, etc.
-    """
     if active_game["status"]:
         await ctx.send("A game is already in progress.")
         return
@@ -170,17 +166,12 @@ async def start(ctx):
     active_game["current_round"] = 0
     active_game["round_in_progress"] = False
     active_game["round_guesses"] = {}
-
-    # NEW: Initialize points to empty
     active_game["points"] = {}
 
     await ctx.send("A new game has started! Type `!join` to participate.")
 
 @bot.command()
 async def join(ctx):
-    """
-    User joins the game, storing which channel they joined in so we can announce them.
-    """
     if not active_game["status"]:
         await ctx.send("No game is currently running. Use `!start` to create a new game.")
         return
@@ -207,10 +198,6 @@ async def join(ctx):
 
 @bot.command()
 async def play(ctx):
-    """
-    Fetch each player's recently played tracks, compile them,
-    and start a 'guess who' round.
-    """
     if not active_game["status"]:
         await ctx.send("No game is active. Use `!start` to begin.")
         return
@@ -288,9 +275,6 @@ async def play(ctx):
     await do_guess_round(ctx)
 
 async def do_guess_round(ctx):
-    """
-    Conduct a single guess round with a 10-second timer.
-    """
     if active_game["current_round"] >= len(active_game["track_pool"]):
         # All tracks guessed -> game over
         await announce_winner_and_reset(ctx, game_finished=True)
@@ -342,6 +326,13 @@ async def do_guess_round(ctx):
             f"The track '{track_name}' belongs to {owner_mentions}."
         )
 
+    # ── IMPORTANT CHECK ─────────────────────────────────────────────────────
+    # If the game ended (e.g., user typed !end), avoid second scoreboard call
+    if not active_game["status"]:
+        # The game is already over, so stop further rounds
+        return
+    # ────────────────────────────────────────────────────────────────────────
+
     active_game["current_round"] += 1
     await do_guess_round(ctx)
 
@@ -384,7 +375,7 @@ async def announce_winner_and_reset(ctx, game_finished=True):
     If game_finished=True, it means we completed all tracks normally.
     """
     # Prepare scoreboard
-    points_map = active_game["points"]  # user_id -> int
+    points_map = active_game["points"]
 
     # Make sure everyone in players is in the dictionary (even if 0)
     for pid in active_game["players"]:
@@ -409,9 +400,7 @@ async def announce_winner_and_reset(ctx, game_finished=True):
         scoreboard_str = "\n".join(scoreboard_lines)
 
         if len(winners) == 1:
-            await ctx.send(
-                "Game over!" if game_finished else "Game ended prematurely!"
-            )
+            await ctx.send("Game over!" if game_finished else "Game ended prematurely!")
             await ctx.send(
                 f"**Final Scores:**\n{scoreboard_str}\n\n"
                 f"**Winner:** <@{winners[0]}> with {top_score} points!"
@@ -419,9 +408,7 @@ async def announce_winner_and_reset(ctx, game_finished=True):
         else:
             # multiple winners (tie)
             tie_mentions = ", ".join(f"<@{w}>" for w in winners)
-            await ctx.send(
-                "Game over!" if game_finished else "Game ended prematurely!"
-            )
+            await ctx.send("Game over!" if game_finished else "Game ended prematurely!")
             await ctx.send(
                 f"**Final Scores:**\n{scoreboard_str}\n\n"
                 f"**Winners (tie):** {tie_mentions} with {top_score} points each!"
