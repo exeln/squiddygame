@@ -53,7 +53,7 @@ def callback():
     """
     Spotify redirects here after user authorizes.
     We exchange the authorization code for an access token.
-    The `state` we sent contains the Discord user ID, 
+    The `state` we sent contains the Discord user ID,
     so we know which user to associate with the token.
     """
     code = request.args.get("code")
@@ -74,11 +74,10 @@ def callback():
         if token_info:
             discord_user_id = str(state)
 
-            # --- Debug prints to avoid accidental overwriting ---
+            # Debug prints to avoid accidental overwriting
             print(f"DEBUG: Received token_info for Discord user {discord_user_id}: {token_info}")
             user_spotify_data[discord_user_id] = token_info
             print(f"DEBUG: user_spotify_data keys are now: {list(user_spotify_data.keys())}")
-            # ---------------------------------------------------
 
             return (
                 "Authorization successful! You can close this tab and return to Discord."
@@ -99,7 +98,7 @@ def get_spotify_client(discord_user_id):
 
     # Create a new OAuth object specifically for this user
     sp_oauth = create_spotify_oauth(state=str(discord_user_id))
-    
+
     if sp_oauth.is_token_expired(token_info):
         try:
             token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
@@ -151,11 +150,11 @@ async def join(ctx):
         return
 
     active_game["players"].add(user_id)
-    
+
     # Create a new OAuth object with the user's Discord ID as state
     sp_oauth = create_spotify_oauth(state=user_id)
     auth_url = sp_oauth.get_authorize_url()
-    
+
     # DM the authorization link
     await ctx.author.send(
         "Click the link below to authorize with Spotify:\n" + auth_url
@@ -194,7 +193,7 @@ async def play(ctx):
                 f"DEBUG: Discord user {player_id} is logged into Spotify as ID '{spotify_user_id}', "
                 f"display name: '{spotify_display_name}'"
             )
-            print(f"DEBUG: sp_client.auth -> {sp_client.auth}")  # Debug: Print the actual token being used
+            # Removed the sp_client.auth debug line to avoid AttributeError
         except Exception as e:
             print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
             continue
