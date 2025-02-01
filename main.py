@@ -4,7 +4,7 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from flask import Flask, request, session
+from flask import Flask, request
 from threading import Thread
 
 import spotipy
@@ -30,8 +30,8 @@ active_game = {
     "round_guesses": {}         # { guesser_discord_id: guessed_discord_id }
 }
 
-# We’ll store the channel ID where each user typed "!join"
-join_channels = {}  # { discord_user_id: channel_id }
+# Track where each user typed !join, so we can announce them as "ready" in that same channel
+join_channels = {}  # { str(discord_user_id): int(channel_id) }
 
 # In-memory storage for user Spotify data: { discord_user_id: token_info }
 user_spotify_data = {}
@@ -80,26 +80,36 @@ def callback():
         if token_info:
             discord_user_id = str(state)
 
-            # Debug prints to avoid accidental overwriting
             print(f"DEBUG: Received token_info for Discord user {discord_user_id}: {token_info}")
             user_spotify_data[discord_user_id] = token_info
             print(f"DEBUG: user_spotify_data keys are now: {list(user_spotify_data.keys())}")
 
             # After successful authorization, post in the original channel
             def confirm_authorization():
+                print(f"DEBUG: confirm_authorization triggered for user {discord_user_id}")
+                # Let's see what channel ID we have stored
                 channel_id = join_channels.get(discord_user_id)
+                print(f"DEBUG: join_channels keys -> {join_channels.keys()}")
+                print(f"DEBUG: channel_id from join_channels is {channel_id} for user {discord_user_id}")
+
                 if channel_id is None:
                     print(f"DEBUG: No stored channel ID for user {discord_user_id}")
                     return
 
                 channel = bot.get_channel(channel_id)
+                print(f"DEBUG: get_channel({channel_id}) returned: {channel}")
+
                 if channel is None:
-                    print(f"DEBUG: Could not find channel object for channel_id {channel_id}")
+                    print(f"DEBUG: Could not find channel object for channel_id {channel_id}. "
+                          f"Make sure the bot has access to that channel, and that it wasn't a DM or thread.")
                     return
 
                 user_obj = bot.get_user(int(discord_user_id))
+                print(f"DEBUG: get_user({discord_user_id}) returned: {user_obj}")
+
                 if user_obj is not None:
-                    coro = channel.send(f"{user_obj.mention} is now ready to play!")
+                    msg = f"{user_obj.mention} is now ready to play!"
+                    coro = channel.send(msg)
                     asyncio.run_coroutine_threadsafe(coro, bot.loop)
                 else:
                     print(f"DEBUG: Could not find user object for {discord_user_id} to mention.")
@@ -123,9 +133,7 @@ def get_spotify_client(discord_user_id):
     if not token_info:
         return None
 
-    # Create a new OAuth object specifically for this user
     sp_oauth = create_spotify_oauth(state=str(discord_user_id))
-
     if sp_oauth.is_token_expired(token_info):
         try:
             token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
@@ -146,7 +154,6 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
 
-
 # ----- DISCORD COMMANDS -----
 @bot.command()
 async def start(ctx):
@@ -166,14 +173,11 @@ async def start(ctx):
 
     await ctx.send("A new game has started! Type `!join` to participate.")
 
-
 @bot.command()
 async def join(ctx):
     """
-    User joins the game.
-    1) We store the channel ID so we can confirm in this channel once they authorize.
-    2) DM them the Spotify authorization link.
-    3) Once they authorize, we send a message to this same channel stating they're ready.
+    User joins the game, we remember the channel they typed !join in,
+    so we can announce them as "ready" after they finish authorizing.
     """
     if not active_game["status"]:
         await ctx.send("No game is currently running. Use `!start` to create a new game.")
@@ -184,11 +188,10 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Store the channel ID so we can send a success message here later
+    # Store the channel ID where they typed !join
     join_channels[user_id] = ctx.channel.id
     active_game["players"].add(user_id)
 
-    # Let them know to check DMs
     await ctx.send(f"{ctx.author.mention}, check your DMs to authorize Spotify.")
 
     sp_oauth = create_spotify_oauth(state=user_id)
@@ -200,7 +203,6 @@ async def join(ctx):
         )
     except discord.Forbidden:
         await ctx.send("I couldn't DM you. Please enable your DMs or add me as a friend.")
-
 
 @bot.command()
 async def play(ctx):
@@ -384,6 +386,7 @@ async def end(ctx):
     active_game["round_guesses"] = {}
 
     await ctx.send("The game has been ended. All data has been reset.")
+
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
