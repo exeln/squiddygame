@@ -275,8 +275,8 @@ async def play(ctx):
     await do_guess_round(ctx)
 
 async def do_guess_round(ctx):
-    if active_game["current_round"] >= len(active_game["track_pool"]):
-        # All tracks guessed -> game over
+    # If we've used all tracks OR if we've reached 20 rounds, end the game
+    if active_game["current_round"] >= len(active_game["track_pool"]) or active_game["current_round"] >= 20:
         await announce_winner_and_reset(ctx, game_finished=True)
         return
 
@@ -326,12 +326,9 @@ async def do_guess_round(ctx):
             f"The track '{track_name}' belongs to {owner_mentions}."
         )
 
-    # ── IMPORTANT CHECK ─────────────────────────────────────────────────────
-    # If the game ended (e.g., user typed !end), avoid second scoreboard call
+    # Check if the game was ended while we slept
     if not active_game["status"]:
-        # The game is already over, so stop further rounds
         return
-    # ────────────────────────────────────────────────────────────────────────
 
     active_game["current_round"] += 1
     await do_guess_round(ctx)
@@ -372,7 +369,7 @@ async def end(ctx):
 async def announce_winner_and_reset(ctx, game_finished=True):
     """
     Announces the scoreboard, then resets the game.
-    If game_finished=True, it means we completed all tracks normally.
+    If game_finished=True, it means we completed all tracks (or 20 rounds) normally.
     """
     # Prepare scoreboard
     points_map = active_game["points"]
