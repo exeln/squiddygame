@@ -1,12 +1,9 @@
-###########################
-# main.py
-###########################
 import os
 import random
 import discord
 from discord.ext import commands
 
-from flask import Flask, request
+from flask import Flask, request, session
 from threading import Thread
 
 import spotipy
@@ -59,7 +56,6 @@ def callback():
     The `state` we sent contains the Discord user ID, 
     so we know which user to associate with the token.
     """
-    sp_oauth = create_spotify_oauth()
     code = request.args.get("code")
     state = request.args.get("state")
     error = request.args.get("error")
@@ -69,7 +65,9 @@ def callback():
 
     if code:
         try:
-            token_info = sp_oauth.get_access_token(code)
+            # Create a new SpotifyOAuth instance for this specific user
+            sp_oauth = create_spotify_oauth(state=state)
+            token_info = sp_oauth.get_access_token(code, check_cache=False)
         except Exception as e:
             return f"Error obtaining access token: {e}", 400
 
@@ -99,18 +97,18 @@ def get_spotify_client(discord_user_id):
     if not token_info:
         return None
 
-    sp_oauth = create_spotify_oauth()
+    # Create a new OAuth object specifically for this user
+    sp_oauth = create_spotify_oauth(state=str(discord_user_id))
+    
     if sp_oauth.is_token_expired(token_info):
         try:
-            refreshed_token = sp_oauth.refresh_access_token(token_info["refresh_token"])
+            token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
+            user_spotify_data[str(discord_user_id)] = token_info
         except Exception as e:
             print(f"DEBUG: Error refreshing token for Discord user {discord_user_id}: {e}")
             return None
-        user_spotify_data[str(discord_user_id)] = refreshed_token
-        token_info = refreshed_token
 
     return spotipy.Spotify(auth=token_info["access_token"])
-
 
 # ----- DISCORD BOT SETUP -----
 intents = discord.Intents.default()
@@ -120,7 +118,6 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
-
 
 # ----- DISCORD COMMANDS -----
 @bot.command()
@@ -139,7 +136,6 @@ async def start(ctx):
 
     await ctx.send("A new game has started! Type `!join` to participate.")
 
-
 @bot.command()
 async def join(ctx):
     """
@@ -155,6 +151,8 @@ async def join(ctx):
         return
 
     active_game["players"].add(user_id)
+    
+    # Create a new OAuth object with the user's Discord ID as state
     sp_oauth = create_spotify_oauth(state=user_id)
     auth_url = sp_oauth.get_authorize_url()
     
@@ -163,7 +161,6 @@ async def join(ctx):
         "Click the link below to authorize with Spotify:\n" + auth_url
     )
     await ctx.send(f"{ctx.author.mention} has joined the game! Check your DMs to authorize Spotify.")
-
 
 @bot.command()
 async def play(ctx):
@@ -197,6 +194,7 @@ async def play(ctx):
                 f"DEBUG: Discord user {player_id} is logged into Spotify as ID '{spotify_user_id}', "
                 f"display name: '{spotify_display_name}'"
             )
+            print(f"DEBUG: sp_client.auth -> {sp_client.auth}")  # Debug: Print the actual token being used
         except Exception as e:
             print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
             continue
@@ -261,7 +259,6 @@ async def play(ctx):
     await ctx.send("Track pool compiled! Starting the game...")
     await do_guess_round(ctx)
 
-
 async def do_guess_round(ctx):
     """
     Conduct a single guess round:
@@ -285,7 +282,6 @@ async def do_guess_round(ctx):
 
     active_game["current_round"] += 1
 
-
 @bot.command()
 async def end(ctx):
     """
@@ -301,7 +297,6 @@ async def end(ctx):
     active_game["current_round"] = 0
 
     await ctx.send("The game has been ended. All data has been reset.")
-
 
 @bot.command()
 async def guess(ctx, user_mention: discord.User = None):
@@ -361,7 +356,6 @@ async def guess(ctx, user_mention: discord.User = None):
     else:
         await ctx.send("All tracks have been used! Game over.")
         active_game["status"] = False
-
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
