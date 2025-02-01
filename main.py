@@ -1,5 +1,6 @@
 import os
 import random
+import asyncio  # NEW import for sleeping
 import discord
 from discord.ext import commands
 
@@ -21,10 +22,12 @@ SCOPES = "user-read-recently-played"
 
 # In-memory storage for active game data
 active_game = {
-    "status": False,     # Whether a game has been started
-    "players": set(),    # Discord user IDs who joined
-    "track_pool": [],    # (track_id, track_name, artist_name, owner_ids) tuples
-    "current_round": 0   # Current round counter
+    "status": False,            # Whether a game has been started
+    "players": set(),           # Discord user IDs who joined
+    "track_pool": [],           # (track_id, track_name, artist_name, owner_ids) tuples
+    "current_round": 0,         # Current round counter
+    "round_in_progress": False, # Whether we are in a 10-second guess window
+    "round_guesses": {}         # { guesser_discord_id: guessed_discord_id }
 }
 
 # In-memory storage for user Spotify data: { discord_user_id: token_info }
@@ -53,7 +56,7 @@ def callback():
     """
     Spotify redirects here after user authorizes.
     We exchange the authorization code for an access token.
-    The `state` we sent contains the Discord user ID,
+    The `state` we sent contains the Discord user ID, 
     so we know which user to associate with the token.
     """
     code = request.args.get("code")
@@ -132,6 +135,8 @@ async def start(ctx):
     active_game["players"] = set()
     active_game["track_pool"] = []
     active_game["current_round"] = 0
+    active_game["round_in_progress"] = False
+    active_game["round_guesses"] = {}
 
     await ctx.send("A new game has started! Type `!join` to participate.")
 
@@ -175,7 +180,6 @@ async def play(ctx):
         return
 
     track_pool = []
-    # We'll keep track of which track IDs have already been added for each user
     user_track_ids = {}
 
     for player_id in active_game["players"]:
@@ -184,7 +188,7 @@ async def play(ctx):
             print(f"DEBUG: No Spotify client for user {player_id}. Possibly not authorized.")
             continue
 
-        # FIRST: Check which Spotify account this user is on
+        # Check which Spotify account this user is on
         try:
             user_info = sp_client.me()
             spotify_user_id = user_info.get("id", "unknown_id")
@@ -193,15 +197,12 @@ async def play(ctx):
                 f"DEBUG: Discord user {player_id} is logged into Spotify as ID '{spotify_user_id}', "
                 f"display name: '{spotify_display_name}'"
             )
-            # Removed the sp_client.auth debug line to avoid AttributeError
         except Exception as e:
             print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
             continue
 
-        # Debug: Show we are fetching data for this user
         print(f"DEBUG: Fetching recently played tracks for user {player_id} ...")
 
-        # Keep a set of track IDs we've already added for this user
         user_track_ids[player_id] = set()
 
         try:
@@ -213,15 +214,12 @@ async def play(ctx):
                 track = item["track"]
                 track_id = track["id"]
 
-                # skip if there's no valid track ID (local songs, etc.)
                 if not track_id:
                     continue
 
-                # Debug: Show track being processed
                 print(f"DEBUG: Processing track for user {player_id} -> {track.get('name')} (ID: {track_id})")
 
                 if track_id in user_track_ids[player_id]:
-                    # Already added this track for the user
                     continue
 
                 user_track_ids[player_id].add(track_id)
@@ -229,19 +227,14 @@ async def play(ctx):
                 track_name = track["name"]
                 artist_name = track["artists"][0]["name"]
 
-                # Check if this track is already in our global pool
                 existing_track = next((t for t in track_pool if t[0] == track_id), None)
                 if existing_track:
-                    # ── DEBUG PRINT ─────────────────────────────────────────────
                     print(f"DEBUG: Merging track '{track_name}' (ID: {track_id})")
                     print(f"       Existing owners: {existing_track[3]}")
                     print(f"       Adding new owner: {player_id}")
-                    # ────────────────────────────────────────────────────────────
                     existing_track[3].add(player_id)
                 else:
-                    # ── DEBUG PRINT ─────────────────────────────────────────────
                     print(f"DEBUG: New track '{track_name}' (ID: {track_id}), owned by {player_id}")
-                    # ────────────────────────────────────────────────────────────
                     track_pool.append((track_id, track_name, artist_name, {player_id}))
 
         except Exception as e:
@@ -263,23 +256,59 @@ async def do_guess_round(ctx):
     Conduct a single guess round:
     1. Pick the next track from the pool.
     2. Prompt the channel: "Who does this track belong to?"
-    3. Wait for guesses via !guess.
+    3. Wait 10s for everyone to guess (only once).
+    4. Announce winners, then move to next track.
     """
     if active_game["current_round"] >= len(active_game["track_pool"]):
         await ctx.send("All tracks have been guessed! Game over.")
         active_game["status"] = False
         return
 
-    track_info = active_game["track_pool"][active_game["current_round"]]
-    _, track_name, artist_name, owner_ids = track_info
+    track_id, track_name, artist_name, owner_ids = active_game["track_pool"][active_game["current_round"]]
 
+    # Prompt the channel
     await ctx.send(
         f"**Guess Round {active_game['current_round']+1}:**\n"
         f"**Track:** {track_name} by {artist_name}\n"
-        "Who does this track belong to? Type `!guess @username`."
+        "You have 10 seconds! Type `!guess @username` to guess."
     )
 
+    # Set round in progress and clear previous guesses
+    active_game["round_in_progress"] = True
+    active_game["round_guesses"] = {}
+
+    # Wait 10 seconds
+    await asyncio.sleep(10)
+
+    # Round ended, evaluate guesses
+    active_game["round_in_progress"] = False
+
+    # Build a list of winners
+    winners = []
+    for guesser_id, guessed_user_id in active_game["round_guesses"].items():
+        if guessed_user_id in owner_ids:
+            winners.append(guesser_id)
+
+    if winners:
+        # If track belongs to multiple owners, mention them all
+        owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
+        # Mention all winners
+        winner_mentions = ", ".join(f"<@{w}>" for w in winners)
+        await ctx.send(
+            f"Time's up! The correct owner(s) for '{track_name}' was {owner_mentions}.\n"
+            f"Congrats to {winner_mentions} for guessing correctly!"
+        )
+    else:
+        # No winners
+        owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
+        await ctx.send(
+            f"Time's up! No one guessed correctly.\n"
+            f"The track '{track_name}' belongs to {owner_mentions}."
+        )
+
+    # Move on to the next round
     active_game["current_round"] += 1
+    await do_guess_round(ctx)
 
 @bot.command()
 async def end(ctx):
@@ -294,67 +323,41 @@ async def end(ctx):
     active_game["players"].clear()
     active_game["track_pool"].clear()
     active_game["current_round"] = 0
+    active_game["round_in_progress"] = False
+    active_game["round_guesses"] = {}
 
     await ctx.send("The game has been ended. All data has been reset.")
 
 @bot.command()
 async def guess(ctx, user_mention: discord.User = None):
     """
-    Player guesses which user the current track belongs to.
-    Example usage: !guess @SomeUser
+    Each user can guess once per round. We'll record it.
+    Actual correctness is determined after 10s.
     """
     if not active_game["status"]:
         await ctx.send("No active game right now.")
+        return
+
+    if not active_game["round_in_progress"]:
+        await ctx.send("No guessing period is active right now or time is up!")
         return
 
     if user_mention is None:
         await ctx.send("Please mention a user to guess. Example: `!guess @SomeUser`")
         return
 
-    # The track that was just posted in the current round
-    current_round_index = active_game["current_round"] - 1
-    if current_round_index < 0:
-        await ctx.send("No track is currently being guessed.")
+    guesser_id = str(ctx.author.id)
+
+    # Ensure user hasn't guessed already this round
+    if guesser_id in active_game["round_guesses"]:
+        await ctx.send("You have already guessed this round!")
         return
 
-    _, track_name, artist_name, owner_ids = active_game["track_pool"][current_round_index]
     guessed_user_id = str(user_mention.id)
 
-    # ── DEBUG PRINTS (GUESS COMMAND) ─────────────────────────────────────────
-    print("DEBUG: ===== GUESS COMMAND TRIGGERED =====")
-    print(f"DEBUG: Track name -> {track_name}")
-    print(f"DEBUG: Artist -> {artist_name}")
-    print(f"DEBUG: Track owner IDs -> {owner_ids}")
-    print(f"DEBUG: Guessed user -> {guessed_user_id}")
-    print(f"DEBUG: Is guessed_user_id in owner_ids? -> {guessed_user_id in owner_ids}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # Check if the guessed user is one of the owners
-    if guessed_user_id in owner_ids:
-        # Only show all owners if there are multiple
-        if len(owner_ids) > 1:
-            owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
-            owners_str = ", ".join(owner_mentions)
-            await ctx.send(
-                f"Correct! The track '{track_name}' by {artist_name} "
-                f"was in multiple users' recently played: {owners_str}!"
-            )
-        else:
-            await ctx.send(
-                f"Correct! The track '{track_name}' by {artist_name} "
-                f"belongs to {user_mention.mention}!"
-            )
-    else:
-        owner_mentions = [f"<@{owner_id}>" for owner_id in owner_ids]
-        owners_str = ", ".join(owner_mentions)
-        await ctx.send(f"Wrong guess! The correct answer was {owners_str}.")
-
-    # Move on to the next round, or end if no more tracks
-    if active_game["current_round"] < len(active_game["track_pool"]):
-        await do_guess_round(ctx)
-    else:
-        await ctx.send("All tracks have been used! Game over.")
-        active_game["status"] = False
+    # Record their guess
+    active_game["round_guesses"][guesser_id] = guessed_user_id
+    await ctx.send(f"{ctx.author.mention} your guess has been recorded!")
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
