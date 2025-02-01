@@ -1,6 +1,6 @@
 import os
 import random
-import asyncio  # Needed for scheduling tasks
+import asyncio
 import discord
 from discord.ext import commands
 
@@ -29,6 +29,9 @@ active_game = {
     "round_in_progress": False, # For the timed guessing version
     "round_guesses": {}         # { guesser_discord_id: guessed_discord_id }
 }
+
+# We’ll store the channel ID where each user typed "!join"
+join_channels = {}  # { discord_user_id: channel_id }
 
 # In-memory storage for user Spotify data: { discord_user_id: token_info }
 user_spotify_data = {}
@@ -82,15 +85,24 @@ def callback():
             user_spotify_data[discord_user_id] = token_info
             print(f"DEBUG: user_spotify_data keys are now: {list(user_spotify_data.keys())}")
 
-            # After successful authorization, DM the user to confirm
+            # After successful authorization, post in the original channel
             def confirm_authorization():
-                # This runs in the bot loop to safely do async calls
-                user = bot.get_user(int(discord_user_id))
-                if user is not None:
-                    coro = user.send("You’re ready to play now that you’ve authorized Spotify!")
+                channel_id = join_channels.get(discord_user_id)
+                if channel_id is None:
+                    print(f"DEBUG: No stored channel ID for user {discord_user_id}")
+                    return
+
+                channel = bot.get_channel(channel_id)
+                if channel is None:
+                    print(f"DEBUG: Could not find channel object for channel_id {channel_id}")
+                    return
+
+                user_obj = bot.get_user(int(discord_user_id))
+                if user_obj is not None:
+                    coro = channel.send(f"{user_obj.mention} is now ready to play!")
                     asyncio.run_coroutine_threadsafe(coro, bot.loop)
                 else:
-                    print(f"DEBUG: Could not find user object for {discord_user_id} to send DM.")
+                    print(f"DEBUG: Could not find user object for {discord_user_id} to mention.")
 
             # Schedule this function to run in the bot event loop
             bot.loop.call_soon_threadsafe(confirm_authorization)
@@ -130,7 +142,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
-
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
@@ -159,11 +170,10 @@ async def start(ctx):
 @bot.command()
 async def join(ctx):
     """
-    User joins the game. 
-    1) Tells them to check DMs to authorize.
-    2) DMs them the link.
-    3) After authorization completes, 
-       the callback route DMs them again to confirm.
+    User joins the game.
+    1) We store the channel ID so we can confirm in this channel once they authorize.
+    2) DM them the Spotify authorization link.
+    3) Once they authorize, we send a message to this same channel stating they're ready.
     """
     if not active_game["status"]:
         await ctx.send("No game is currently running. Use `!start` to create a new game.")
@@ -174,22 +184,23 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Let them know to check DMs
-    await ctx.send(f"{ctx.author.mention}, please check your DMs to authorize Spotify.")
-
+    # Store the channel ID so we can send a success message here later
+    join_channels[user_id] = ctx.channel.id
     active_game["players"].add(user_id)
 
-    # Create a new OAuth object with the user's Discord ID as state
+    # Let them know to check DMs
+    await ctx.send(f"{ctx.author.mention}, check your DMs to authorize Spotify.")
+
     sp_oauth = create_spotify_oauth(state=user_id)
     auth_url = sp_oauth.get_authorize_url()
 
-    # DM the authorization link
     try:
         await ctx.author.send(
             "Click the link below to authorize with Spotify:\n" + auth_url
         )
     except discord.Forbidden:
         await ctx.send("I couldn't DM you. Please enable your DMs or add me as a friend.")
+
 
 @bot.command()
 async def play(ctx):
@@ -373,7 +384,6 @@ async def end(ctx):
     active_game["round_guesses"] = {}
 
     await ctx.send("The game has been ended. All data has been reset.")
-
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
