@@ -22,12 +22,12 @@ SCOPES = "user-read-recently-played"
 
 # In-memory storage for active game data
 active_game = {
-    "status": False,
-    "players": set(),
-    "track_pool": [],
-    "current_round": 0,
+    "status": False,        # Whether a game has been started
+    "players": set(),       # Discord user IDs who joined
+    "track_pool": [],       # (track_id, track_name, artist_name, owner_ids) tuples
+    "current_round": 0,     # Current round counter
     "round_in_progress": False,
-    "round_guesses": {}
+    "round_guesses": {}     # { guesser_discord_id: guessed_discord_id }
 }
 
 # We'll store the channel ID where each user typed !join, so we can announce them in that channel
@@ -56,6 +56,12 @@ def index():
 
 @app.route("/callback")
 def callback():
+    """
+    Spotify redirects here after user authorizes.
+    We exchange the authorization code for an access token.
+    The `state` we sent contains the Discord user ID,
+    so we know which user to associate with the token.
+    """
     code = request.args.get("code")
     state = request.args.get("state")
     error = request.args.get("error")
@@ -127,7 +133,6 @@ def callback():
     else:
         return "No code returned from Spotify.", 400
 
-
 def get_spotify_client(discord_user_id):
     token_info = user_spotify_data.get(str(discord_user_id))
     if not token_info:
@@ -144,13 +149,12 @@ def get_spotify_client(discord_user_id):
 
     return spotipy.Spotify(auth=token_info["access_token"])
 
-
 # ----- DISCORD BOT SETUP -----
 intents = discord.Intents.default()
 intents.message_content = True
 # For user references to work properly, you may need these:
 # intents.members = True
-# Or in the Developer Portal, enable the "Server Members Intent"
+# And enable "Server Members Intent" in the Dev Portal
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
 @bot.event
@@ -184,7 +188,6 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Store the channel ID
     join_channels[user_id] = ctx.channel.id
     active_game["players"].add(user_id)
 
@@ -300,10 +303,18 @@ async def do_guess_round(ctx):
 
     active_game["round_in_progress"] = False
 
+    # Check each guess
     winners = []
     for guesser_id, guessed_user_id in active_game["round_guesses"].items():
+        # If the guessed user is one of the owners, it's potentially correct
         if guessed_user_id in owner_ids:
-            winners.append(guesser_id)
+            # But skip awarding if guesser is the same user
+            if guesser_id == guessed_user_id:
+                # They guessed themselves, do not award
+                continue
+            else:
+                # They guessed another correct owner
+                winners.append(guesser_id)
 
     if winners:
         owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
