@@ -1,6 +1,6 @@
 import os
 import random
-import asyncio  # NEW import for sleeping
+import asyncio  # Needed for scheduling tasks
 import discord
 from discord.ext import commands
 
@@ -26,7 +26,7 @@ active_game = {
     "players": set(),           # Discord user IDs who joined
     "track_pool": [],           # (track_id, track_name, artist_name, owner_ids) tuples
     "current_round": 0,         # Current round counter
-    "round_in_progress": False, # Whether we are in a 10-second guess window
+    "round_in_progress": False, # For the timed guessing version
     "round_guesses": {}         # { guesser_discord_id: guessed_discord_id }
 }
 
@@ -82,13 +82,25 @@ def callback():
             user_spotify_data[discord_user_id] = token_info
             print(f"DEBUG: user_spotify_data keys are now: {list(user_spotify_data.keys())}")
 
-            return (
-                "Authorization successful! You can close this tab and return to Discord."
-            )
+            # After successful authorization, DM the user to confirm
+            def confirm_authorization():
+                # This runs in the bot loop to safely do async calls
+                user = bot.get_user(int(discord_user_id))
+                if user is not None:
+                    coro = user.send("You’re ready to play now that you’ve authorized Spotify!")
+                    asyncio.run_coroutine_threadsafe(coro, bot.loop)
+                else:
+                    print(f"DEBUG: Could not find user object for {discord_user_id} to send DM.")
+
+            # Schedule this function to run in the bot event loop
+            bot.loop.call_soon_threadsafe(confirm_authorization)
+
+            return "Authorization successful! You can close this tab and return to Discord."
         else:
             return "Could not get token info from Spotify.", 400
     else:
         return "No code returned from Spotify.", 400
+
 
 def get_spotify_client(discord_user_id):
     """
@@ -112,14 +124,17 @@ def get_spotify_client(discord_user_id):
 
     return spotipy.Spotify(auth=token_info["access_token"])
 
+
 # ----- DISCORD BOT SETUP -----
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
+
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
+
 
 # ----- DISCORD COMMANDS -----
 @bot.command()
@@ -140,10 +155,15 @@ async def start(ctx):
 
     await ctx.send("A new game has started! Type `!join` to participate.")
 
+
 @bot.command()
 async def join(ctx):
     """
-    User joins the game. We provide a link to authorize with Spotify.
+    User joins the game. 
+    1) Tells them to check DMs to authorize.
+    2) DMs them the link.
+    3) After authorization completes, 
+       the callback route DMs them again to confirm.
     """
     if not active_game["status"]:
         await ctx.send("No game is currently running. Use `!start` to create a new game.")
@@ -154,6 +174,9 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
+    # Let them know to check DMs
+    await ctx.send(f"{ctx.author.mention}, please check your DMs to authorize Spotify.")
+
     active_game["players"].add(user_id)
 
     # Create a new OAuth object with the user's Discord ID as state
@@ -161,16 +184,18 @@ async def join(ctx):
     auth_url = sp_oauth.get_authorize_url()
 
     # DM the authorization link
-    await ctx.author.send(
-        "Click the link below to authorize with Spotify:\n" + auth_url
-    )
-    await ctx.send(f"{ctx.author.mention} has joined the game! Check your DMs to authorize Spotify.")
+    try:
+        await ctx.author.send(
+            "Click the link below to authorize with Spotify:\n" + auth_url
+        )
+    except discord.Forbidden:
+        await ctx.send("I couldn't DM you. Please enable your DMs or add me as a friend.")
 
 @bot.command()
 async def play(ctx):
     """
     Fetch each player's recently played tracks, compile them,
-    and start a 'guess who' round.
+    and start a 'guess who' round (timed).
     """
     if not active_game["status"]:
         await ctx.send("No game is active. Use `!start` to begin.")
@@ -253,11 +278,7 @@ async def play(ctx):
 
 async def do_guess_round(ctx):
     """
-    Conduct a single guess round:
-    1. Pick the next track from the pool.
-    2. Prompt the channel: "Who does this track belong to?"
-    3. Wait 10s for everyone to guess (only once).
-    4. Announce winners, then move to next track.
+    Conduct a single guess round with a 10-second timer.
     """
     if active_game["current_round"] >= len(active_game["track_pool"]):
         await ctx.send("All tracks have been guessed! Game over.")
@@ -290,16 +311,13 @@ async def do_guess_round(ctx):
             winners.append(guesser_id)
 
     if winners:
-        # If track belongs to multiple owners, mention them all
         owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
-        # Mention all winners
         winner_mentions = ", ".join(f"<@{w}>" for w in winners)
         await ctx.send(
             f"Time's up! The correct owner(s) for '{track_name}' was {owner_mentions}.\n"
             f"Congrats to {winner_mentions} for guessing correctly!"
         )
     else:
-        # No winners
         owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
         await ctx.send(
             f"Time's up! No one guessed correctly.\n"
@@ -309,6 +327,34 @@ async def do_guess_round(ctx):
     # Move on to the next round
     active_game["current_round"] += 1
     await do_guess_round(ctx)
+
+@bot.command()
+async def guess(ctx, user_mention: discord.User = None):
+    """
+    Each user can guess once per 10-second round.
+    We'll record it, then check winners after the timer ends.
+    """
+    if not active_game["status"]:
+        await ctx.send("No active game right now.")
+        return
+
+    if not active_game["round_in_progress"]:
+        await ctx.send("No guessing period is active right now or time is up!")
+        return
+
+    if user_mention is None:
+        await ctx.send("Please mention a user to guess. Example: `!guess @SomeUser`")
+        return
+
+    guesser_id = str(ctx.author.id)
+
+    if guesser_id in active_game["round_guesses"]:
+        await ctx.send("You have already guessed this round!")
+        return
+
+    guessed_user_id = str(user_mention.id)
+    active_game["round_guesses"][guesser_id] = guessed_user_id
+    await ctx.send(f"{ctx.author.mention} your guess has been recorded!")
 
 @bot.command()
 async def end(ctx):
@@ -328,36 +374,6 @@ async def end(ctx):
 
     await ctx.send("The game has been ended. All data has been reset.")
 
-@bot.command()
-async def guess(ctx, user_mention: discord.User = None):
-    """
-    Each user can guess once per round. We'll record it.
-    Actual correctness is determined after 10s.
-    """
-    if not active_game["status"]:
-        await ctx.send("No active game right now.")
-        return
-
-    if not active_game["round_in_progress"]:
-        await ctx.send("No guessing period is active right now or time is up!")
-        return
-
-    if user_mention is None:
-        await ctx.send("Please mention a user to guess. Example: `!guess @SomeUser`")
-        return
-
-    guesser_id = str(ctx.author.id)
-
-    # Ensure user hasn't guessed already this round
-    if guesser_id in active_game["round_guesses"]:
-        await ctx.send("You have already guessed this round!")
-        return
-
-    guessed_user_id = str(user_mention.id)
-
-    # Record their guess
-    active_game["round_guesses"][guesser_id] = guessed_user_id
-    await ctx.send(f"{ctx.author.mention} your guess has been recorded!")
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
