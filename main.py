@@ -27,13 +27,14 @@ active_game = {
     "track_pool": [],       # (track_id, track_name, artist_name, owner_ids) tuples
     "current_round": 0,     # Current round counter
     "round_in_progress": False,
-    "round_guesses": {}     # { guesser_discord_id: guessed_discord_id }
+    "round_guesses": {},    # { guesser_discord_id: guessed_discord_id }
+    "points": {}            # { user_id: int }  <--- NEW: track points
 }
 
-# We'll store the channel ID where each user typed !join, so we can announce them in that channel
+# We'll store the channel ID where each user typed !join
 join_channels = {}  # { str(discord_user_id): int(channel_id) }
 
-# In-memory storage for user Spotify data: { discord_user_id: token_info }
+# In-memory storage for user Spotify data
 user_spotify_data = {}
 
 # ----- FLASK APP FOR SPOTIFY OAUTH -----
@@ -56,12 +57,6 @@ def index():
 
 @app.route("/callback")
 def callback():
-    """
-    Spotify redirects here after user authorizes.
-    We exchange the authorization code for an access token.
-    The `state` we sent contains the Discord user ID,
-    so we know which user to associate with the token.
-    """
     code = request.args.get("code")
     state = request.args.get("state")
     error = request.args.get("error")
@@ -152,18 +147,19 @@ def get_spotify_client(discord_user_id):
 # ----- DISCORD BOT SETUP -----
 intents = discord.Intents.default()
 intents.message_content = True
-# For user references to work properly, you may need these:
-# intents.members = True
-# And enable "Server Members Intent" in the Dev Portal
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
 
+
 # ----- DISCORD COMMANDS -----
 @bot.command()
 async def start(ctx):
+    """
+    Start a new game session. Resets state, etc.
+    """
     if active_game["status"]:
         await ctx.send("A game is already in progress.")
         return
@@ -175,10 +171,16 @@ async def start(ctx):
     active_game["round_in_progress"] = False
     active_game["round_guesses"] = {}
 
+    # NEW: Initialize points to empty
+    active_game["points"] = {}
+
     await ctx.send("A new game has started! Type `!join` to participate.")
 
 @bot.command()
 async def join(ctx):
+    """
+    User joins the game, storing which channel they joined in so we can announce them.
+    """
     if not active_game["status"]:
         await ctx.send("No game is currently running. Use `!start` to create a new game.")
         return
@@ -205,6 +207,10 @@ async def join(ctx):
 
 @bot.command()
 async def play(ctx):
+    """
+    Fetch each player's recently played tracks, compile them,
+    and start a 'guess who' round.
+    """
     if not active_game["status"]:
         await ctx.send("No game is active. Use `!start` to begin.")
         return
@@ -282,14 +288,16 @@ async def play(ctx):
     await do_guess_round(ctx)
 
 async def do_guess_round(ctx):
+    """
+    Conduct a single guess round with a 10-second timer.
+    """
     if active_game["current_round"] >= len(active_game["track_pool"]):
-        await ctx.send("All tracks have been guessed! Game over.")
-        active_game["status"] = False
+        # All tracks guessed -> game over
+        await announce_winner_and_reset(ctx, game_finished=True)
         return
 
     track_id, track_name, artist_name, owner_ids = active_game["track_pool"][active_game["current_round"]]
 
-    # Prompt the channel
     await ctx.send(
         f"**Guess Round {active_game['current_round']+1}:**\n"
         f"**Track:** {track_name} by {artist_name}\n"
@@ -303,19 +311,23 @@ async def do_guess_round(ctx):
 
     active_game["round_in_progress"] = False
 
-    # Check each guess
+    # Build winners (1 point each)
     winners = []
     for guesser_id, guessed_user_id in active_game["round_guesses"].items():
-        # If the guessed user is one of the owners, it's potentially correct
+        # If the guessed user is among the owners, it's correct
         if guessed_user_id in owner_ids:
-            # But skip awarding if guesser is the same user
+            # Skip awarding if guesser is the same user
             if guesser_id == guessed_user_id:
-                # They guessed themselves, do not award
                 continue
-            else:
-                # They guessed another correct owner
-                winners.append(guesser_id)
+            winners.append(guesser_id)
 
+    # Award points
+    for w in winners:
+        if w not in active_game["points"]:
+            active_game["points"][w] = 0
+        active_game["points"][w] += 1
+
+    # Announce result
     if winners:
         owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
         winner_mentions = ", ".join(f"<@{w}>" for w in winners)
@@ -338,11 +350,9 @@ async def guess(ctx, user_mention: discord.User = None):
     if not active_game["status"]:
         await ctx.send("No active game right now.")
         return
-
     if not active_game["round_in_progress"]:
         await ctx.send("No guessing period is active right now or time is up!")
         return
-
     if user_mention is None:
         await ctx.send("Please mention a user to guess. Example: `!guess @SomeUser`")
         return
@@ -358,19 +368,75 @@ async def guess(ctx, user_mention: discord.User = None):
 
 @bot.command()
 async def end(ctx):
+    """
+    Ends the current game prematurely. We still show the scoreboard.
+    """
     if not active_game["status"]:
         await ctx.send("No game is currently running.")
         return
 
+    await announce_winner_and_reset(ctx, game_finished=False)
+
+# Helper function to announce winners & reset
+async def announce_winner_and_reset(ctx, game_finished=True):
+    """
+    Announces the scoreboard, then resets the game.
+    If game_finished=True, it means we completed all tracks normally.
+    """
+    # Prepare scoreboard
+    points_map = active_game["points"]  # user_id -> int
+
+    # Make sure everyone in players is in the dictionary (even if 0)
+    for pid in active_game["players"]:
+        if pid not in points_map:
+            points_map[pid] = 0
+
+    # Convert to list of (user_id, points)
+    scoreboard = [(pid, points_map[pid]) for pid in active_game["players"]]
+    # Sort descending by points
+    scoreboard.sort(key=lambda x: x[1], reverse=True)
+
+    if scoreboard:
+        top_score = scoreboard[0][1]
+        # Everyone who has that top score
+        winners = [uid for (uid, pts) in scoreboard if pts == top_score]
+
+        # Build a readable scoreboard string
+        scoreboard_lines = []
+        for (uid, pts) in scoreboard:
+            scoreboard_lines.append(f"<@{uid}>: {pts} points")
+
+        scoreboard_str = "\n".join(scoreboard_lines)
+
+        if len(winners) == 1:
+            await ctx.send(
+                "Game over!" if game_finished else "Game ended prematurely!"
+            )
+            await ctx.send(
+                f"**Final Scores:**\n{scoreboard_str}\n\n"
+                f"**Winner:** <@{winners[0]}> with {top_score} points!"
+            )
+        else:
+            # multiple winners (tie)
+            tie_mentions = ", ".join(f"<@{w}>" for w in winners)
+            await ctx.send(
+                "Game over!" if game_finished else "Game ended prematurely!"
+            )
+            await ctx.send(
+                f"**Final Scores:**\n{scoreboard_str}\n\n"
+                f"**Winners (tie):** {tie_mentions} with {top_score} points each!"
+            )
+    else:
+        await ctx.send("No one scored any points, so no winner. Maybe no guesses?")
+
+    # Reset state
     active_game["status"] = False
     active_game["players"].clear()
     active_game["track_pool"].clear()
     active_game["current_round"] = 0
     active_game["round_in_progress"] = False
     active_game["round_guesses"] = {}
-
-    await ctx.send("The game has been ended. All data has been reset.")
-
+    active_game["points"] = {}
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
 def run_flask():
