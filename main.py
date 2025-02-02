@@ -21,8 +21,6 @@ REDIRECT_URI = "https://web-production-b04e.up.railway.app/callback"
 SCOPES = "user-read-recently-played"
 
 # ----- MULTI-SERVER GAME STATES -----
-# Instead of one global dict, we store a dict of game states keyed by guild_id
-# Each game state is the same structure we had before, but now per server
 active_games = {}  # { guild_id: { ...gameState... } }
 
 def get_game_state(ctx):
@@ -43,10 +41,10 @@ def get_game_state(ctx):
         }
     return active_games[guild_id]
 
-# We store for each user ID a (guild_id, channel_id) so we know where to announce "ready"
+# For each user ID, we store (guild_id, channel_id) to announce "ready" post-auth
 join_channels = {}  # { user_id: (guild_id, channel_id) }
 
-# In-memory storage for user Spotify data: { discord_user_id: token_info }
+# In-memory storage for user Spotify data
 user_spotify_data = {}
 
 # ----- FLASK APP FOR SPOTIFY OAUTH -----
@@ -92,7 +90,6 @@ def callback():
             def confirm_authorization():
                 async def confirm_authorization_async():
                     print(f"DEBUG: confirm_authorization triggered for user {discord_user_id}")
-                    # Retrieve (guild_id, channel_id) from join_channels
                     guild_channel = join_channels.get(discord_user_id)
                     if not guild_channel:
                         print(f"DEBUG: No stored guild/channel for user {discord_user_id}")
@@ -104,7 +101,7 @@ def callback():
                     channel = bot.get_channel(channel_id)
                     print(f"DEBUG: get_channel({channel_id}) returned: {channel}")
                     if channel is None:
-                        print("DEBUG: Could not find channel object. Check bot permissions or if channel is valid.")
+                        print("DEBUG: Could not find channel object (check permissions or if it's valid).")
                         return
 
                     try:
@@ -120,7 +117,6 @@ def callback():
                     else:
                         print(f"DEBUG: Could not fetch user object for {discord_user_id} to mention.")
 
-                # Schedule the async function
                 asyncio.run_coroutine_threadsafe(confirm_authorization_async(), bot.loop)
 
             bot.loop.call_soon_threadsafe(confirm_authorization)
@@ -185,11 +181,11 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Store the guild/channel for the user
+    # Store the guild/channel ID for this user
     join_channels[user_id] = (ctx.guild.id, ctx.channel.id)
     game_state["players"].add(user_id)
 
-    await ctx.send(f"{ctx.author.mention}, check your DMs to authorize Spotify (optional).")
+    await ctx.send(f"{ctx.author.mention}, check your DMs to optionally authorize Spotify.")
 
     sp_oauth = create_spotify_oauth(state=user_id)
     auth_url = sp_oauth.get_authorize_url()
@@ -197,7 +193,7 @@ async def join(ctx):
     try:
         await ctx.author.send(
             "Click the link below to authorize with Spotify:\n" + auth_url + "\n"
-            "If you choose not to authorize, you can still guess but won't add any tracks."
+            "If you don't authorize, you can still guess, but no tracks will be added on your behalf."
         )
     except discord.Forbidden:
         await ctx.send("I couldn't DM you. Please enable your DMs or add me as a friend.")
@@ -208,7 +204,6 @@ async def play(ctx):
     if not game_state["status"]:
         await ctx.send("No game is active. Use `!start` to begin.")
         return
-
     if len(game_state["players"]) < 2:
         await ctx.send("Need at least 2 players to play!")
         return
@@ -219,8 +214,8 @@ async def play(ctx):
     for player_id in game_state["players"]:
         sp_client = get_spotify_client(player_id)
         if sp_client is None:
-            print(f"DEBUG: No Spotify client for user {player_id}. Possibly not authorized.")
-            # They can still play (guess), but we skip adding tracks
+            print(f"DEBUG: No Spotify client for user {player_id} (not authorized). Skipping tracks.")
+            # They can guess, but no tracks from them
             continue
 
         try:
@@ -228,16 +223,14 @@ async def play(ctx):
             spotify_user_id = user_info.get("id", "unknown_id")
             spotify_display_name = user_info.get("display_name", "Unknown Display Name")
             print(
-                f"DEBUG: (Guild {ctx.guild.id}) Discord user {player_id} => Spotify ID '{spotify_user_id}', "
-                f"display name: '{spotify_display_name}'"
+                f"DEBUG: (Guild {ctx.guild.id}) Discord user {player_id} => "
+                f"Spotify ID '{spotify_user_id}', display name: '{spotify_display_name}'"
             )
         except Exception as e:
             print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
             continue
 
-        print(f"DEBUG: Fetching recently played tracks for user {player_id} ...")
         user_track_ids[player_id] = set()
-
         try:
             results = sp_client.current_user_recently_played(limit=20)
             items_count = len(results['items'])
@@ -257,7 +250,6 @@ async def play(ctx):
                 track_name = track["name"]
                 artist_name = track["artists"][0]["name"]
 
-                # See if this track is already in the global pool
                 existing_track = next((t for t in track_pool if t[0] == track_id), None)
                 if existing_track:
                     existing_track[3].add(player_id)
@@ -268,10 +260,9 @@ async def play(ctx):
             print(f"Error fetching recent tracks for user {player_id}: {e}")
 
     if not track_pool:
-        await ctx.send("No tracks found or no one authorized Spotify. The game can still proceed, but there's nothing to guess!")
-        # You could return or you can let them guess with an empty pool
-        # We'll proceed so they can do a round with no songs if they want
-        # return
+        await ctx.send("No tracks found or nobody authorized. We'll still proceed, but there's nothing to guess!")
+        # We won't return so they can do a 'round' if they want
+        # but the track pool is empty => the game will end quickly
 
     random.shuffle(track_pool)
     game_state["track_pool"] = track_pool
@@ -281,14 +272,17 @@ async def play(ctx):
     await do_guess_round(ctx)
 
 async def do_guess_round(ctx):
+    """
+    The main round logic. If we've used all tracks or hit 20 rounds, end the game.
+    Otherwise, show the next track, wait 10s for guesses, and award points.
+    """
     game_state = get_game_state(ctx)
 
-    # If we've used all tracks or we've hit 20 rounds, end the game
     if game_state["current_round"] >= len(game_state["track_pool"]) or game_state["current_round"] >= 20:
+        # Enough rounds or no more tracks
         await announce_winner_and_reset(ctx, game_finished=True)
         return
 
-    # Grab the next track
     track_id, track_name, artist_name, owner_ids = game_state["track_pool"][game_state["current_round"]]
 
     await ctx.send(
@@ -304,11 +298,10 @@ async def do_guess_round(ctx):
 
     game_state["round_in_progress"] = False
 
-    # Score correct guesses
     winners = []
     for guesser_id, guessed_user_id in game_state["round_guesses"].items():
         if guessed_user_id in owner_ids:
-            # Skip awarding if guesser is the same user
+            # skip awarding if guesser is the same user
             if guesser_id == guessed_user_id:
                 continue
             winners.append(guesser_id)
@@ -319,7 +312,7 @@ async def do_guess_round(ctx):
             game_state["points"][w] = 0
         game_state["points"][w] += 1
 
-    # Announce result
+    # Announce results of this round
     if winners:
         owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
         winner_mentions = ", ".join(f"<@{w}>" for w in winners)
@@ -334,7 +327,7 @@ async def do_guess_round(ctx):
             f"The track '{track_name}' belongs to {owner_mentions}."
         )
 
-    # Check if the game is still active (maybe someone typed !end)
+    # If the game was ended while we were sleeping, skip continuing
     if not game_state["status"]:
         return
 
@@ -344,6 +337,7 @@ async def do_guess_round(ctx):
 @bot.command()
 async def guess(ctx, user_mention: discord.User = None):
     game_state = get_game_state(ctx)
+
     if not game_state["status"]:
         await ctx.send("No active game in this server right now.")
         return
@@ -377,13 +371,13 @@ async def end(ctx):
 
 async def announce_winner_and_reset(ctx, game_finished=True):
     """
-    Announces the scoreboard for the current server, then resets that server's game.
+    Announces the scoreboard for this server, then resets that server's game state.
     """
     game_state = get_game_state(ctx)
     points_map = game_state["points"]
     players = game_state["players"]
 
-    # Make sure every player is in points_map
+    # Make sure all players appear in points_map
     for pid in players:
         if pid not in points_map:
             points_map[pid] = 0
@@ -414,8 +408,7 @@ async def announce_winner_and_reset(ctx, game_finished=True):
     else:
         await ctx.send("No one scored any points, so no winner. Maybe no guesses?")
 
-    # Reset only this server's game
-    # (Remove the entire state from active_games or reinitialize it)
+    # Reset only this server
     guild_id = ctx.guild.id
     active_games[guild_id] = {
         "status": False,
