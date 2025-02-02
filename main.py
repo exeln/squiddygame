@@ -37,7 +37,8 @@ def get_game_state(ctx):
             "current_round": 0,
             "round_in_progress": False,
             "round_guesses": {},
-            "points": {}
+            "points": {},
+            "round_task": None  # <--- We'll store the running round's Task here
         }
     return active_games[guild_id]
 
@@ -101,7 +102,7 @@ def callback():
                     channel = bot.get_channel(channel_id)
                     print(f"DEBUG: get_channel({channel_id}) returned: {channel}")
                     if channel is None:
-                        print("DEBUG: Could not find channel object (check permissions or if it's valid).")
+                        print("DEBUG: Could not find channel object (check permissions).")
                         return
 
                     try:
@@ -167,6 +168,11 @@ async def start(ctx):
     game_state["round_guesses"] = {}
     game_state["points"] = {}
 
+    # If a leftover round task was still stored, cancel it to be safe
+    if game_state.get("round_task"):
+        game_state["round_task"].cancel()
+        game_state["round_task"] = None
+
     await ctx.send("A new game has started! Type `!join` to participate.")
 
 @bot.command()
@@ -181,7 +187,6 @@ async def join(ctx):
         await ctx.send("You have already joined the game.")
         return
 
-    # Store the guild/channel ID for this user
     join_channels[user_id] = (ctx.guild.id, ctx.channel.id)
     game_state["players"].add(user_id)
 
@@ -200,6 +205,9 @@ async def join(ctx):
 
 @bot.command()
 async def play(ctx):
+    """
+    Gathers tracks and starts the first round by scheduling do_guess_round in a Task.
+    """
     game_state = get_game_state(ctx)
     if not game_state["status"]:
         await ctx.send("No game is active. Use `!start` to begin.")
@@ -215,17 +223,12 @@ async def play(ctx):
         sp_client = get_spotify_client(player_id)
         if sp_client is None:
             print(f"DEBUG: No Spotify client for user {player_id} (not authorized). Skipping tracks.")
-            # They can guess, but no tracks from them
             continue
 
         try:
             user_info = sp_client.me()
-            spotify_user_id = user_info.get("id", "unknown_id")
-            spotify_display_name = user_info.get("display_name", "Unknown Display Name")
-            print(
-                f"DEBUG: (Guild {ctx.guild.id}) Discord user {player_id} => "
-                f"Spotify ID '{spotify_user_id}', display name: '{spotify_display_name}'"
-            )
+            _spotify_user_id = user_info.get("id", "unknown_id")
+            _spotify_display_name = user_info.get("display_name", "Unknown Display Name")
         except Exception as e:
             print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
             continue
@@ -233,20 +236,15 @@ async def play(ctx):
         user_track_ids[player_id] = set()
         try:
             results = sp_client.current_user_recently_played(limit=20)
-            items_count = len(results['items'])
-            print(f"DEBUG: Found {items_count} recently played items for user {player_id}.")
-
             for item in results["items"]:
                 track = item["track"]
                 track_id = track["id"]
                 if not track_id:
                     continue
-
                 if track_id in user_track_ids[player_id]:
                     continue
 
                 user_track_ids[player_id].add(track_id)
-
                 track_name = track["name"]
                 artist_name = track["artists"][0]["name"]
 
@@ -255,89 +253,103 @@ async def play(ctx):
                     existing_track[3].add(player_id)
                 else:
                     track_pool.append((track_id, track_name, artist_name, {player_id}))
-
         except Exception as e:
             print(f"Error fetching recent tracks for user {player_id}: {e}")
 
     if not track_pool:
-        await ctx.send("No tracks found or nobody authorized. We'll still proceed, but there's nothing to guess!")
-        # We won't return so they can do a 'round' if they want
-        # but the track pool is empty => the game will end quickly
+        await ctx.send("No tracks found or nobody authorized. We'll proceed, but there's nothing to guess!")
 
     random.shuffle(track_pool)
     game_state["track_pool"] = track_pool
     game_state["current_round"] = 0
 
+    # If a leftover round task existed, cancel it
+    if game_state.get("round_task"):
+        game_state["round_task"].cancel()
+
+    # Create a new task that runs do_guess_round
+    task = bot.loop.create_task(do_guess_round(ctx))
+    game_state["round_task"] = task
+
     await ctx.send("Track pool compiled! Starting the game...")
-    await do_guess_round(ctx)
 
 async def do_guess_round(ctx):
     """
-    The main round logic. If we've used all tracks or hit 20 rounds, end the game.
-    Otherwise, show the next track, wait 10s for guesses, and award points.
+    The main loop for each round.
+    We'll do the 10-second wait, awarding points, and move to next round
+    until we reach 20 or run out of tracks.
     """
-    game_state = get_game_state(ctx)
+    try:
+        while True:
+            game_state = get_game_state(ctx)
 
-    if game_state["current_round"] >= len(game_state["track_pool"]) or game_state["current_round"] >= 20:
-        # Enough rounds or no more tracks
-        await announce_winner_and_reset(ctx, game_finished=True)
+            # If the game is ended externally, bail out
+            if not game_state["status"]:
+                return
+
+            # If we've used all tracks or hit 20 rounds, end game
+            if game_state["current_round"] >= len(game_state["track_pool"]) or game_state["current_round"] >= 20:
+                await announce_winner_and_reset(ctx, game_finished=True)
+                return
+
+            track_id, track_name, artist_name, owner_ids = game_state["track_pool"][game_state["current_round"]]
+            await ctx.send(
+                f"**Guess Round {game_state['current_round']+1}:**\n"
+                f"**Track:** {track_name} by {artist_name}\n"
+                "You have 10 seconds! Type `!guess @username` to guess."
+            )
+
+            game_state["round_in_progress"] = True
+            game_state["round_guesses"] = {}
+
+            # Sleep 10s
+            await asyncio.sleep(10)
+
+            # If the game is ended while we slept, bail out
+            if not game_state["status"]:
+                return
+
+            game_state["round_in_progress"] = False
+
+            # Tally winners
+            winners = []
+            for guesser_id, guessed_user_id in game_state["round_guesses"].items():
+                if guessed_user_id in owner_ids:
+                    # skip awarding if guesser is the same user
+                    if guesser_id == guessed_user_id:
+                        continue
+                    winners.append(guesser_id)
+
+            # Award points
+            for w in winners:
+                if w not in game_state["points"]:
+                    game_state["points"][w] = 0
+                game_state["points"][w] += 1
+
+            if winners:
+                owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
+                winner_mentions = ", ".join(f"<@{w}>" for w in winners)
+                await ctx.send(
+                    f"Time's up! The correct owner(s) for '{track_name}' was {owner_mentions}.\n"
+                    f"Congrats to {winner_mentions} for guessing correctly!"
+                )
+            else:
+                owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
+                await ctx.send(
+                    f"Time's up! No one guessed correctly.\n"
+                    f"The track '{track_name}' belongs to {owner_mentions}."
+                )
+
+            # Move to the next round
+            game_state["current_round"] += 1
+
+    except asyncio.CancelledError:
+        # Round was cancelled (e.g., someone did !end or a new !play)
         return
-
-    track_id, track_name, artist_name, owner_ids = game_state["track_pool"][game_state["current_round"]]
-
-    await ctx.send(
-        f"**Guess Round {game_state['current_round']+1}:**\n"
-        f"**Track:** {track_name} by {artist_name}\n"
-        "You have 10 seconds! Type `!guess @username` to guess."
-    )
-
-    game_state["round_in_progress"] = True
-    game_state["round_guesses"] = {}
-
-    await asyncio.sleep(10)
-
-    game_state["round_in_progress"] = False
-
-    winners = []
-    for guesser_id, guessed_user_id in game_state["round_guesses"].items():
-        if guessed_user_id in owner_ids:
-            # skip awarding if guesser is the same user
-            if guesser_id == guessed_user_id:
-                continue
-            winners.append(guesser_id)
-
-    # Award points
-    for w in winners:
-        if w not in game_state["points"]:
-            game_state["points"][w] = 0
-        game_state["points"][w] += 1
-
-    # Announce results of this round
-    if winners:
-        owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
-        winner_mentions = ", ".join(f"<@{w}>" for w in winners)
-        await ctx.send(
-            f"Time's up! The correct owner(s) for '{track_name}' was {owner_mentions}.\n"
-            f"Congrats to {winner_mentions} for guessing correctly!"
-        )
-    else:
-        owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
-        await ctx.send(
-            f"Time's up! No one guessed correctly.\n"
-            f"The track '{track_name}' belongs to {owner_mentions}."
-        )
-
-    # If the game was ended while we were sleeping, skip continuing
-    if not game_state["status"]:
-        return
-
-    game_state["current_round"] += 1
-    await do_guess_round(ctx)
 
 @bot.command()
 async def guess(ctx, user_mention: discord.User = None):
     game_state = get_game_state(ctx)
-
     if not game_state["status"]:
         await ctx.send("No active game in this server right now.")
         return
@@ -361,11 +373,17 @@ async def guess(ctx, user_mention: discord.User = None):
 async def end(ctx):
     """
     Ends the current game prematurely in this server. We still show the scoreboard.
+    Also cancel any ongoing round Task so it can't finish and cause a second scoreboard.
     """
     game_state = get_game_state(ctx)
     if not game_state["status"]:
         await ctx.send("No game is currently running in this server.")
         return
+
+    # Cancel any ongoing round Task
+    if game_state.get("round_task"):
+        game_state["round_task"].cancel()
+        game_state["round_task"] = None
 
     await announce_winner_and_reset(ctx, game_finished=False)
 
@@ -377,10 +395,11 @@ async def announce_winner_and_reset(ctx, game_finished=True):
     points_map = game_state["points"]
     players = game_state["players"]
 
-    # Make sure all players appear in points_map
+    # Mark the status as False, so no new rounds continue
+    game_state["status"] = False
+
     for pid in players:
-        if pid not in points_map:
-            points_map[pid] = 0
+        points_map.setdefault(pid, 0)
 
     scoreboard = [(pid, points_map[pid]) for pid in players]
     scoreboard.sort(key=lambda x: x[1], reverse=True)
@@ -408,7 +427,7 @@ async def announce_winner_and_reset(ctx, game_finished=True):
     else:
         await ctx.send("No one scored any points, so no winner. Maybe no guesses?")
 
-    # Reset only this server
+    # Fully reset this server's state
     guild_id = ctx.guild.id
     active_games[guild_id] = {
         "status": False,
@@ -417,7 +436,8 @@ async def announce_winner_and_reset(ctx, game_finished=True):
         "current_round": 0,
         "round_in_progress": False,
         "round_guesses": {},
-        "points": {}
+        "points": {},
+        "round_task": None
     }
 
 # ----- RUN FLASK (SPOTIFY OAUTH) IN A SEPARATE THREAD -----
