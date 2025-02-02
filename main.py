@@ -292,19 +292,12 @@ async def do_guess_round(ctx):
                 await announce_winner_and_reset(ctx, game_finished=True)
                 return
 
-            track_id, track_name, artist_name, owner_ids, album_cover_url = game_state["track_pool"][game_state["current_round"]]
-
-            # Create an embed to display the track info and cover art
-            embed = discord.Embed(
-                title=f"Guess Round {game_state['current_round']+1}",
-                description=f"**Track:** {track_name}\n**Artist:** {artist_name}",
-                color=discord.Color.blue()
+            track_id, track_name, artist_name, owner_ids = game_state["track_pool"][game_state["current_round"]]
+            await ctx.send(
+                f"**Guess Round {game_state['current_round']+1}:**\n"
+                f"**Track:** {track_name} by {artist_name}\n"
+                "You have 10 seconds! Type `!guess @username` to guess."
             )
-            if album_cover_url:
-                embed.set_thumbnail(url=album_cover_url)
-            embed.set_footer(text="You have 10 seconds! Type `!guess @username` to guess.")
-
-            await ctx.send(embed=embed)
 
             game_state["round_in_progress"] = True
             game_state["round_guesses"] = {}
