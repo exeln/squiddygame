@@ -247,12 +247,14 @@ async def play(ctx):
                 user_track_ids[player_id].add(track_id)
                 track_name = track["name"]
                 artist_name = track["artists"][0]["name"]
+                # Get album cover URL
+                album_cover_url = track["album"]["images"][0]["url"] if track["album"]["images"] else None
 
                 existing_track = next((t for t in track_pool if t[0] == track_id), None)
                 if existing_track:
-                    existing_track[3].add(player_id)
+                    existing_track[4].add(player_id)
                 else:
-                    track_pool.append((track_id, track_name, artist_name, {player_id}))
+                    track_pool.append((track_id, track_name, artist_name, album_cover_url, {player_id}))
         except Exception as e:
             print(f"Error fetching recent tracks for user {player_id}: {e}")
 
@@ -292,12 +294,17 @@ async def do_guess_round(ctx):
                 await announce_winner_and_reset(ctx, game_finished=True)
                 return
 
-            track_id, track_name, artist_name, owner_ids = game_state["track_pool"][game_state["current_round"]]
-            await ctx.send(
-                f"**Guess Round {game_state['current_round']+1}:**\n"
-                f"**Track:** {track_name} by {artist_name}\n"
-                "You have 10 seconds! Type `!guess @username` to guess."
+            track_id, track_name, artist_name, album_cover_url, owner_ids = game_state["track_pool"][game_state["current_round"]]
+            
+            # Create embed with cover art
+            embed = discord.Embed(
+                title=f"Guess Round {game_state['current_round']+1}",
+                description=f"**Track:** {track_name}\n**Artist:** {artist_name}\n\nYou have 10 seconds! Type `!guess @username` to guess."
             )
+            if album_cover_url:
+                embed.set_thumbnail(url=album_cover_url)
+            
+            await ctx.send(embed=embed)
 
             game_state["round_in_progress"] = True
             game_state["round_guesses"] = {}
