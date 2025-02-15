@@ -390,13 +390,20 @@ async def do_guess_round(ctx):
 
             track_id, track_name, artist_name, album_cover_url, owner_ids = game_state["track_pool"][game_state["current_round"]]
             
-            # Create embed with cover art
+            # Create Spotify track URL
+            spotify_track_url = f"https://open.spotify.com/track/{track_id}"
+            
+            # Create embed with cover art, Spotify link, and attribution
             embed = discord.Embed(
                 title=f"Guess Round {game_state['current_round']+1}",
-                description=f"**Track:** {track_name}\n**Artist:** {artist_name}\n\nYou have 10 seconds! Type `!guess @username` to guess."
+                description=f"**Track:** [{track_name}]({spotify_track_url})\n**Artist:** {artist_name}\n\nYou have 10 seconds! Type `!guess @username` to guess.",
+                color=0x1DB954  # Spotify's brand green color
             )
             if album_cover_url:
                 embed.set_thumbnail(url=album_cover_url)
+            
+            # Add Spotify attribution
+            embed.set_footer(text="Powered by Spotify", icon_url="https://storage.googleapis.com/pr-newsroom-wp/1/2018/11/Spotify_Logo_RGB_Green.png")
             
             await ctx.send(embed=embed)
 
@@ -431,14 +438,14 @@ async def do_guess_round(ctx):
                 owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
                 winner_mentions = ", ".join(f"<@{w}>" for w in winners)
                 await ctx.send(
-                    f"Time's up! The correct owner(s) for '{track_name}' was {owner_mentions}.\n"
+                    f"Time's up! The correct owner(s) for '[{track_name}]({spotify_track_url})' was {owner_mentions}.\n"
                     f"Congrats to {winner_mentions} for guessing correctly!"
                 )
             else:
                 owner_mentions = ", ".join(f"<@{o}>" for o in owner_ids)
                 await ctx.send(
                     f"Time's up! No one guessed correctly.\n"
-                    f"The track '{track_name}' belongs to {owner_mentions}."
+                    f"The track '[{track_name}]({spotify_track_url})' belongs to {owner_mentions}."
                 )
 
             # Move to the next round
