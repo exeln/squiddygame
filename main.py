@@ -278,7 +278,7 @@ async def play(ctx):
 @bot.command()
 async def playlikes(ctx):
     """
-    Similar to !play but uses liked songs instead of recently played tracks.
+    Similar to !play but uses random liked songs instead of recently played tracks.
     """
     game_state = get_game_state(ctx)
     if not game_state["status"]:
@@ -307,26 +307,48 @@ async def playlikes(ctx):
 
         user_track_ids[player_id] = set()
         try:
-            results = sp_client.current_user_saved_tracks(limit=20)
-            for item in results["items"]:
-                track = item["track"]
-                track_id = track["id"]
-                if not track_id:
-                    continue
-                if track_id in user_track_ids[player_id]:
-                    continue
+            # First, get total number of liked songs
+            initial_results = sp_client.current_user_saved_tracks(limit=1)
+            total_tracks = initial_results["total"]
+            
+            if total_tracks == 0:
+                print(f"User {player_id} has no liked songs")
+                continue
 
-                user_track_ids[player_id].add(track_id)
-                track_name = track["name"]
-                artist_name = track["artists"][0]["name"]
-                # Get album cover URL
-                album_cover_url = track["album"]["images"][0]["url"] if track["album"]["images"] else None
+            # Generate 20 random unique offsets within the user's library size
+            max_offset = max(0, total_tracks - 1)  # -1 because offset is 0-based
+            random_offsets = set()
+            while len(random_offsets) < min(20, total_tracks):
+                random_offsets.add(random.randint(0, max_offset))
+            
+            # Fetch each randomly selected track
+            for offset in random_offsets:
+                try:
+                    result = sp_client.current_user_saved_tracks(limit=1, offset=offset)
+                    if not result["items"]:
+                        continue
+                        
+                    item = result["items"][0]
+                    track = item["track"]
+                    track_id = track["id"]
+                    
+                    if not track_id or track_id in user_track_ids[player_id]:
+                        continue
 
-                existing_track = next((t for t in track_pool if t[0] == track_id), None)
-                if existing_track:
-                    existing_track[4].add(player_id)
-                else:
-                    track_pool.append((track_id, track_name, artist_name, album_cover_url, {player_id}))
+                    user_track_ids[player_id].add(track_id)
+                    track_name = track["name"]
+                    artist_name = track["artists"][0]["name"]
+                    album_cover_url = track["album"]["images"][0]["url"] if track["album"]["images"] else None
+
+                    existing_track = next((t for t in track_pool if t[0] == track_id), None)
+                    if existing_track:
+                        existing_track[4].add(player_id)
+                    else:
+                        track_pool.append((track_id, track_name, artist_name, album_cover_url, {player_id}))
+                except Exception as e:
+                    print(f"Error fetching individual track at offset {offset} for user {player_id}: {e}")
+                    continue
+                    
         except Exception as e:
             print(f"Error fetching liked tracks for user {player_id}: {e}")
 
@@ -345,7 +367,7 @@ async def playlikes(ctx):
     task = bot.loop.create_task(do_guess_round(ctx))
     game_state["round_task"] = task
 
-    await ctx.send("Track pool compiled from liked songs! Starting the game...")
+    await ctx.send("Track pool compiled from random liked songs! Starting the game...")
     
 async def do_guess_round(ctx):
     """
