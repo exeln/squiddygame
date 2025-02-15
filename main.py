@@ -18,7 +18,7 @@ DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 # ----- CONFIGURATIONS -----
 BOT_PREFIX = '!'
 REDIRECT_URI = "https://web-production-b04e.up.railway.app/callback"
-SCOPES = "user-read-recently-played"
+SCOPES = "user-read-recently-played user-library-read"
 
 # ----- MULTI-SERVER GAME STATES -----
 active_games = {}  # { guild_id: { ...gameState... } }
@@ -275,6 +275,78 @@ async def play(ctx):
 
     await ctx.send("Track pool compiled! Starting the game...")
 
+@bot.command()
+async def playlikes(ctx):
+    """
+    Similar to !play but uses liked songs instead of recently played tracks.
+    """
+    game_state = get_game_state(ctx)
+    if not game_state["status"]:
+        await ctx.send("No game is active. Use `!start` to begin.")
+        return
+    if len(game_state["players"]) < 2:
+        await ctx.send("Need at least 2 players to play!")
+        return
+
+    track_pool = []
+    user_track_ids = {}
+
+    for player_id in game_state["players"]:
+        sp_client = get_spotify_client(player_id)
+        if sp_client is None:
+            print(f"DEBUG: No Spotify client for user {player_id} (not authorized). Skipping tracks.")
+            continue
+
+        try:
+            user_info = sp_client.me()
+            _spotify_user_id = user_info.get("id", "unknown_id")
+            _spotify_display_name = user_info.get("display_name", "Unknown Display Name")
+        except Exception as e:
+            print(f"DEBUG: Error calling sp_client.me() for {player_id}: {e}")
+            continue
+
+        user_track_ids[player_id] = set()
+        try:
+            results = sp_client.current_user_saved_tracks(limit=20)
+            for item in results["items"]:
+                track = item["track"]
+                track_id = track["id"]
+                if not track_id:
+                    continue
+                if track_id in user_track_ids[player_id]:
+                    continue
+
+                user_track_ids[player_id].add(track_id)
+                track_name = track["name"]
+                artist_name = track["artists"][0]["name"]
+                # Get album cover URL
+                album_cover_url = track["album"]["images"][0]["url"] if track["album"]["images"] else None
+
+                existing_track = next((t for t in track_pool if t[0] == track_id), None)
+                if existing_track:
+                    existing_track[4].add(player_id)
+                else:
+                    track_pool.append((track_id, track_name, artist_name, album_cover_url, {player_id}))
+        except Exception as e:
+            print(f"Error fetching liked tracks for user {player_id}: {e}")
+
+    if not track_pool:
+        await ctx.send("No tracks found or nobody authorized. We'll proceed, but there's nothing to guess!")
+
+    random.shuffle(track_pool)
+    game_state["track_pool"] = track_pool
+    game_state["current_round"] = 0
+
+    # If a leftover round task existed, cancel it
+    if game_state.get("round_task"):
+        game_state["round_task"].cancel()
+
+    # Create a new task that runs do_guess_round
+    task = bot.loop.create_task(do_guess_round(ctx))
+    game_state["round_task"] = task
+
+    await ctx.send("Track pool compiled from liked songs! Starting the game...")
+    
 async def do_guess_round(ctx):
     """
     The main loop for each round.
